@@ -11,7 +11,8 @@ ICON = {"darwin": "packaging/icon.icns", "win32": "packaging/icon.ico"}.get(sys.
 a = Analysis(
     ["run.py"],
     pathex=["."],
-    datas=[("packaging/icon.png", "packaging")],
+    # sg_helper.py runs under the pipeline's Python, so it ships as a file, not inside the archive.
+    datas=[("packaging/icon.png", "packaging"), ("blendsketch/sg_helper.py", "blendsketch")],
     hiddenimports=["PySide6.QtSvg", "PySide6.QtMultimedia"],
     excludes=["tkinter", "PySide6.QtWebEngineCore", "PySide6.QtWebEngineWidgets", "PySide6.Qt3DCore",
               "PySide6.QtQuick", "PySide6.QtQml", "PySide6.QtCharts", "PySide6.QtDataVisualization",

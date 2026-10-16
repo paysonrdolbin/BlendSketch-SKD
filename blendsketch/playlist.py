@@ -157,12 +157,13 @@ class Playlist:
     # -- creation / IO
 
     @classmethod
-    def create(cls, path: str, name: str, author: str) -> "Playlist":
+    def create(cls, path: str, name: str, author: str, pid: str | None = None) -> "Playlist":
+        """pid fixes the playlist's id, so two people creating the same file merge instead of overwriting."""
         t = now()
         data = {
             "format": FORMAT,
             "version": VERSION,
-            "id": new_id(),
+            "id": pid or new_id(),
             "created": t,
             "created_by": author,
             "name": {"value": name, "modified": t},
@@ -274,11 +275,11 @@ class Playlist:
     def item(self, iid: str) -> dict | None:
         return self.data["items"].get(iid)
 
-    def add_item(self, path: str, info: dict, author: str) -> dict:
+    def add_item(self, path: str, info: dict, author: str, iid: str | None = None) -> dict:
         t = now()
         label = os.path.splitext(os.path.basename(path))[0]
         item = {
-            "id": new_id(),
+            "id": iid or new_id(),
             "label": label,
             "added_by": author,
             "created": t,
@@ -290,7 +291,7 @@ class Playlist:
             "comments": {},
         }
         self.data["items"][item["id"]] = item
-        self.set_order([*self.data["order"]["value"], item["id"]])
+        self.set_order([*(i for i in self.data["order"]["value"] if i != item["id"]), item["id"]])
         return item
 
     def remove_item(self, iid: str):

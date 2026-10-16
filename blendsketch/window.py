@@ -9,10 +9,11 @@ from PySide6.QtCore import QEvent, QObject, Qt, QTimer
 from PySide6.QtGui import QAction, QActionGroup, QGuiApplication, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
-    QPlainTextEdit, QPushButton, QSizePolicy, QSplitter, QStackedWidget, QToolButton, QVBoxLayout, QWidget, QAbstractSpinBox,
+    QPlainTextEdit, QProgressDialog, QPushButton, QSizePolicy, QSplitter, QStackedWidget, QToolButton, QVBoxLayout, QWidget,
+    QAbstractSpinBox,
 )
 
-from . import APP_NAME
+from . import APP_NAME, skd
 from .canvas import Canvas
 from .colors import author_color
 from .icons import icon
@@ -20,6 +21,7 @@ from .media import MediaError, Player, VideoReader, frame_to_qimage, probe
 from .panels import ComposeBox, NotesTree, PlaylistPanel, PrefsDialog, scroll_wrap
 from .playlist import EXT, Playlist, PlaylistError, find_by_name, new_id, now
 from .prefs import Prefs
+from .skd_dialog import SKDOpenDialog, Worker
 from .strokes import BLENDS, MAIN_BLENDS, TOOL_LABELS
 from .timeline import Timeline
 from .widgets import BlendPanel, BrushPanel, ColorPanel, section_label
@@ -276,11 +278,14 @@ class MainWindow(QMainWindow):
         lay.addWidget(sub)
         row = QHBoxLayout()
         row.addStretch(1)
+        sg = QPushButton("SKD Open Playlist…")
+        sg.setObjectName("Primary")
+        sg.clicked.connect(self.skd_open_dialog)
         new = QPushButton("New playlist…")
-        new.setObjectName("Primary")
         new.clicked.connect(self.new_playlist)
         op = QPushButton("Open playlist…")
         op.clicked.connect(self.open_dialog)
+        row.addWidget(sg)
         row.addWidget(new)
         row.addWidget(op)
         row.addStretch(1)
@@ -325,6 +330,8 @@ class MainWindow(QMainWindow):
             menu.addAction(a)
             return a
 
+        act(m, "SKD Open Playlist…", self.skd_open_dialog, "Ctrl+Shift+O")
+        m.addSeparator()
         act(m, "New Playlist…", self.new_playlist, QKeySequence.StandardKey.New)
         act(m, "Open Playlist…", self.open_dialog, QKeySequence.StandardKey.Open)
         self.recent_menu = m.addMenu("Open Recent")
@@ -547,6 +554,70 @@ class MainWindow(QMainWindow):
                 self._fill_recent()
             return
         self._load_playlist(pl)
+
+    # ---------------------------------------------------------------- SKD (ShotGrid)
+
+    def skd_open_dialog(self):
+        dlg = SKDOpenDialog(self.prefs, self)
+        if dlg.exec() == SKDOpenDialog.DialogCode.Accepted and dlg.chosen:
+            self.open_skd_playlist(dlg.chosen.id)
+
+    def open_skd_playlist(self, playlist_id: int):
+        """Fetch a ShotGrid playlist's footage in the background, then open its shared notes file."""
+        if not self.maybe_save():
+            return
+        progress = QProgressDialog("Reading the playlist from ShotGrid…", "Cancel", 0, 0, self)
+        progress.setWindowTitle("SKD Open Playlist")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setAutoReset(False)
+        progress.setAutoClose(False)
+        progress.setMinimumDuration(0)
+        progress.setMinimumWidth(460)
+        worker = Worker(lambda report, cancelled: skd.prepare(playlist_id, report, cancelled), self)
+
+        def report(text, done, total):
+            progress.setLabelText(text)
+            progress.setMaximum(1000 if total else 0)
+            if total:
+                progress.setValue(min(1000, int(done * 1000 / total)))
+
+        worker.progress.connect(report)
+        worker.finished.connect(worker.deleteLater)  # only once the thread has stopped
+        progress.canceled.connect(worker.cancel)
+        worker.succeeded.connect(lambda r: (progress.close(), self._skd_loaded(r)))
+        worker.failed.connect(lambda msg: (progress.close(), QMessageBox.warning(self, "Couldn't open the playlist", msg)))
+        worker.start()
+        progress.show()
+
+    def _skd_loaded(self, r: dict | None):
+        if r is None:
+            self.status.showMessage("Cancelled", 3000)
+            return
+        sg_pl = r["playlist"]
+        path = skd.notes_path(sg_pl["id"])
+        try:
+            skd.ensure_review_dir()
+            if os.path.exists(path):
+                pl = Playlist.open(path)
+            else:
+                pl = Playlist.create(path, sg_pl["code"], self.prefs.author, pid=f"sg_playlist_{sg_pl['id']}")
+        except (PlaylistError, OSError) as e:
+            QMessageBox.warning(self, "Couldn't open the review notes", f"{e}\n\nNotes for this playlist live in {path}.")
+            return
+        changed = skd.sync(pl, r["versions"], r["media"], self.prefs.mappings, self.prefs.author)
+        if sg_pl["code"] and pl.name != sg_pl["code"]:
+            pl.rename(sg_pl["code"])
+            changed = True
+        if changed:
+            try:
+                pl.save()  # the clip list is shared too, so the next person opens the same clips
+            except PlaylistError as e:
+                QMessageBox.warning(self, "Couldn't save the clip list", str(e))
+        self._load_playlist(pl)
+        if r["skipped"]:
+            n = len(r["skipped"])
+            QMessageBox.information(self, "Some Versions have no footage",
+                                    f"{n} Version{'s' if n != 1 else ''} couldn't be added:\n\n" + "\n".join(r["skipped"]))
 
     def _load_playlist(self, pl: Playlist):
         self.player.unload()

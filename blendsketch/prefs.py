@@ -84,6 +84,15 @@ class Prefs:
         self._set("color_mode", v)
 
     @property
+    def skd_department(self) -> str:
+        """The department last picked in SKD Open Playlist."""
+        return self._get("skd_department", "")
+
+    @skd_department.setter
+    def skd_department(self, v: str):
+        self._set("skd_department", v)
+
+    @property
     def recent_files(self) -> list[str]:
         return self._get("recent_files", [])
 
