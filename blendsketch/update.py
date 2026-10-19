@@ -25,10 +25,14 @@ import bootstrap
 
 from . import __version__
 
-REPO = "paysonrdolbin/BlendSketch"
+REPO = "paysonrdolbin/BlendSketch-SKD"
 CHANNEL = "code-latest"
 MANIFEST = "code-manifest.json"
 DOWNLOAD_PAGE = f"https://github.com/{REPO}/releases/latest"
+
+
+# Runs under the pipeline's Python (see skd.py), so its imports aren't the app's to provide.
+OUTSIDE_APP = {"sg_helper.py"}
 
 
 class UpdateError(Exception):
@@ -137,7 +141,7 @@ def code_problems(root: str) -> list[str]:
     problems = []
     for folder, _dirs, files in os.walk(root):
         for f in files:
-            if not f.endswith(".py"):
+            if not f.endswith(".py") or f in OUTSIDE_APP:
                 continue
             path = os.path.join(folder, f)
             rel = os.path.relpath(path, root)

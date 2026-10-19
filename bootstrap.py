@@ -18,7 +18,7 @@ import json
 import os
 import sys
 
-APP = "BlendSketch"
+APP = "BlendSketch-SKD"  # its own data folder, so plain BlendSketch updates never load in SKD
 ACTIVE: dict | None = None   # info about the downloaded code in use, if any
 FALLBACK: str | None = None  # why downloaded code wasn't used, when it should have been
 TEST_RUNTIME: dict | None = None  # tests pretend to be a packaged app with this
