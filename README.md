@@ -57,6 +57,16 @@ BlendSketch/BlendSketch --update                         # Linux (BlendSketch.ex
 - If downloaded code fails to start, the app starts with its built-in code instead, and that update isn't offered again. `--bundled` always starts the built-in code; `--version` shows which code is running.
 - Running from source never updates itself; use `git pull`.
 
+## Syncing with BlendSketch
+
+BlendSketch-SKD is BlendSketch plus SKD Open Playlist. To bring in BlendSketch's latest main:
+
+    ./sync.sh             # fetch, merge, run the tests, push to origin
+    ./sync.sh --no-push   # same, without pushing
+
+Pushing publishes the code SKD's in-app updater installs. On a conflict the script stops with
+the merge in progress; keep SKD's side of its own changes, commit, and run it again.
+
 ## How footage is found
 
 Each clip stores a path relative to the playlist file and the absolute path it was added from. When a playlist opens, BlendSketch tries, in order:
