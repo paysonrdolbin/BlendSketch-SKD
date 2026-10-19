@@ -4,35 +4,40 @@ from __future__ import annotations
 
 import copy
 import os
+import sys
 
-from PySide6.QtCore import QEvent, QObject, Qt, QTimer
-from PySide6.QtGui import QAction, QActionGroup, QGuiApplication, QKeySequence
+from PySide6.QtCore import QEvent, QObject, QProcess, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import QAction, QDesktopServices, QGuiApplication, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
     QPlainTextEdit, QProgressDialog, QPushButton, QSizePolicy, QSplitter, QStackedWidget, QToolButton, QVBoxLayout, QWidget,
     QAbstractSpinBox,
 )
 
-from . import APP_NAME, skd
+import bootstrap
+
+from . import APP_NAME, skd, update
 from .canvas import Canvas
 from .colors import author_color
 from .icons import icon
 from .media import MediaError, Player, VideoReader, frame_to_qimage, probe
-from .panels import ComposeBox, NotesTree, PlaylistPanel, PrefsDialog, scroll_wrap
+from .layers import LayerStore, layer_order, make_layer, migrate
+from .panels import ComposeBox, LayersPanel, NotesTree, PlaylistPanel, PrefsDialog, scroll_wrap
 from .playlist import EXT, Playlist, PlaylistError, find_by_name, new_id, now
 from .prefs import Prefs
 from .skd_dialog import SKDOpenDialog, Worker
-from .strokes import BLENDS, MAIN_BLENDS, TOOL_LABELS
+from .strokes import BLENDS, MAIN_BLENDS
 from .timeline import Timeline
 from .widgets import BlendPanel, BrushPanel, ColorPanel, section_label
 
 HIDDEN_MARK = "#4a5060"
 MEDIA_FILTER = "Footage (*.mov *.mp4 *.m4v *.mxf *.mkv *.avi *.webm *.png *.jpg *.jpeg *.tif *.tiff *.exr *.dpx);;All files (*)"
 PLAYLIST_FILTER = f"BlendSketch playlist (*{EXT})"
+UNDO_LIMIT = 100  # pixel undo keeps the changed area of each stroke, so keep the history bounded
 TOOLS = [("pen", "Pen", "P"), ("brush", "Soft brush: best for Multiply shading and Screen glows", "B"),
-         ("smudge", "Smudge: drag the pixels under the brush", "S"),
+         ("smudge", "Smudge: drag the pixels of your selected layer", "S"),
          ("line", "Line", "L"), ("arrow", "Arrow", "A"), ("rect", "Rectangle", "R"), ("ellipse", "Ellipse", "O"),
-         ("text", "Text", "T"), ("eraser", "Eraser: removes your own marks", "E"), ("picker", "Eyedropper (or hold Alt/Option)", "I")]
+         ("text", "Text", "T"), ("eraser", "Eraser: erases from your selected layer", "E"), ("picker", "Eyedropper (or hold Alt/Option)", "I")]
 
 
 def is_text_input(w) -> bool:
@@ -60,6 +65,27 @@ class AltPicker(QObject):
         return False
 
 
+class UpdateWorker(QThread):
+    """Checks for (and optionally installs) an update off the UI thread."""
+
+    done = Signal(dict)  # {"state", "message"}
+
+    def __init__(self, install: bool, parent=None):
+        super().__init__(parent)
+        self.install = install
+
+    def run(self):
+        try:
+            if self.install:
+                state, message = update.update()
+                r = {"state": state, "message": message}
+            else:
+                r = update.check()
+        except (update.UpdateError, OSError, KeyError, ValueError) as e:
+            r = {"state": "error", "message": str(e)}
+        self.done.emit(r)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, prefs: Prefs):
         super().__init__()
@@ -76,15 +102,17 @@ class MainWindow(QMainWindow):
         self.infos: dict[str, dict] = {}
         self.last_frame: dict[str, int] = {}
         # What this machine hides. View-only: never written to the playlist.
-        self.hidden_stroke_authors: set[str] = set()
+        self.hidden_layers: set[str] = set()
         self.hidden_comment_authors: set[str] = set()
-        self.hidden_strokes: set[str] = set()
         self.hidden_comments: set[str] = set()
         self.undo_stack: list = []
         self.redo_stack: list = []
         self.dirty = False
-        self.by_frame: dict[int, list] = {}      # visible strokes
-        self.all_by_frame: dict[int, list] = {}  # every live stroke, hidden or not
+        self.store = LayerStore()                # every layer's pixels
+        self.picked_layer: dict[tuple, str] = {}  # (item, frame, you) -> the layer you last clicked there
+        self._opacity_before: dict | None = None
+        self.by_frame: dict[int, list] = {}      # visible layers, bottom to top
+        self.all_by_frame: dict[int, list] = {}  # every live layer, hidden or not
         self.player = Player(prefs.cache_mb)
         self._build_ui()
         self._build_menus()
@@ -106,6 +134,11 @@ class MainWindow(QMainWindow):
         else:
             self.resize(1480, 900)
         self._show_welcome()
+        self._update_worker = None
+        if bootstrap.FALLBACK:
+            QTimer.singleShot(0, lambda: self.status.showMessage(bootstrap.FALLBACK, 15000))
+        elif bootstrap.runtime() is not None:  # the packaged app: look for updates quietly
+            QTimer.singleShot(5000, lambda: self.check_updates(quiet=True))
 
     # ================================================================ UI
 
@@ -229,7 +262,7 @@ class MainWindow(QMainWindow):
         self.blend = BlendPanel()
         self.color = ColorPanel(self.prefs)
         self.brush = BrushPanel()
-        self.stroke_tree = NotesTree("strokes")
+        self.layers_panel = LayersPanel()
         self.comment_tree = NotesTree("comments")
         self.compose = ComposeBox()
         comments_box = QWidget()
@@ -238,8 +271,8 @@ class MainWindow(QMainWindow):
         cbl.setSpacing(6)
         cbl.addWidget(self.comment_tree)
         cbl.addWidget(self.compose)
-        for title, w in (("Blend mode", self.blend), ("Color", self.color), ("Brush", self.brush),
-                         ("Strokes on this frame", self.stroke_tree), ("Comments on this frame", comments_box)):
+        for title, w in (("Layer blend mode", self.blend), ("Color", self.color), ("Brush", self.brush),
+                         ("Layers on this frame", self.layers_panel), ("Comments on this frame", comments_box)):
             il.addWidget(section_label(title))
             il.addWidget(w)
             sep = QWidget()
@@ -351,7 +384,10 @@ class MainWindow(QMainWindow):
         self.a_undo = act(e, "Undo", self.undo, QKeySequence.StandardKey.Undo)
         self.a_redo = act(e, "Redo", self.redo, QKeySequence.StandardKey.Redo)
         e.addSeparator()
-        act(e, "Clear My Marks on This Frame", self.clear_mine, None)
+        act(e, "New Layer", self.new_layer, "Ctrl+Shift+N")
+        act(e, "Move Layer Up", lambda: self._step_active(-1), "Ctrl+Shift+Up")
+        act(e, "Move Layer Down", lambda: self._step_active(1), "Ctrl+Shift+Down")
+        act(e, "Delete My Layers on This Frame", self.clear_mine, None)
 
         t = mb.addMenu("&Tools")
         for key, tip, sc in TOOLS:
@@ -383,6 +419,10 @@ class MainWindow(QMainWindow):
         act(p, "Previous Clip", lambda: self.step_clip(-1), "Up")
         self.a_mute = act(p, "Mute", lambda: self.mute_btn.toggle(), "M")
 
+        h = mb.addMenu("&Help")
+        act(h, "Check for Updates…", lambda: self.check_updates(quiet=False)).setMenuRole(QAction.MenuRole.ApplicationSpecificRole)
+        act(h, f"About {APP_NAME}", self.about).setMenuRole(QAction.MenuRole.AboutRole)
+
     def _fill_recent_menu(self):
         self.recent_menu.clear()
         for path in self.prefs.recent_files:
@@ -398,7 +438,7 @@ class MainWindow(QMainWindow):
         self.player.error.connect(lambda m: self.status.showMessage(m, 6000))
         self.canvas.decodeSizeWanted.connect(self.player.set_size)
         self.canvas.strokeCommitted.connect(self.add_stroke)
-        self.canvas.eraseCommitted.connect(self.erase_strokes)
+        self.canvas.notice.connect(lambda m: self.status.showMessage(m, 4000))
         self.canvas.colorPicked.connect(self._picked)
         self.canvas.zoomChanged.connect(lambda z: self.zoom_label.setText("Fit" if abs(z - 1) < 1e-3 else f"{z * 100:.0f}% of fit"))
         self.timeline.seek.connect(self.goto)
@@ -409,11 +449,18 @@ class MainWindow(QMainWindow):
         self.brush.opacityChanged.connect(self._opacity_changed)
         self.brush.pressureChanged.connect(lambda v: self.settings.__setitem__("pressure", v))
         self.brush.fillChanged.connect(lambda v: self.settings.__setitem__("fill", v))
-        self.stroke_tree.authorToggled.connect(lambda name, on: self._author_toggled(name, "strokes", on))
-        self.comment_tree.authorToggled.connect(lambda name, on: self._author_toggled(name, "comments", on))
-        self.stroke_tree.itemToggled.connect(lambda ids, on: self._items_toggled("strokes", ids, on))
+        lp = self.layers_panel
+        lp.tree.layerPicked.connect(self.pick_layer)
+        lp.tree.itemToggled.connect(lambda ids, on: self._items_toggled("layers", ids, on))
+        lp.tree.deleteRequested.connect(lambda ids: self.delete_records("layers", ids))
+        lp.tree.moveRequested.connect(self.move_layers)
+        lp.tree.stepRequested.connect(self.step_layers)
+        lp.add_btn.clicked.connect(self.new_layer)
+        lp.opacity.sliderPressed.connect(self._opacity_pressed)
+        lp.opacity.valueChanged.connect(self._opacity_value)
+        lp.opacity.sliderReleased.connect(self._opacity_released)
+        self.comment_tree.authorToggled.connect(self._author_toggled)
         self.comment_tree.itemToggled.connect(lambda ids, on: self._items_toggled("comments", ids, on))
-        self.stroke_tree.deleteRequested.connect(lambda ids: self.delete_records("strokes", ids))
         self.comment_tree.deleteRequested.connect(lambda ids: self.delete_records("comments", ids))
         self.compose.addRequested.connect(self.add_comment)
         pp = self.playlist_panel
@@ -484,8 +531,12 @@ class MainWindow(QMainWindow):
         self.blend.set_preview(self.settings["color"], v)
 
     def set_blend(self, key):
+        """Set the selected layer's blend mode (and the one new layers start with)."""
         self.settings["blend"] = key
         self.blend.set_mode(key)
+        active = self._active_layer()
+        if active is not None and active["blend"] != key:
+            self._set_layer(active, blend=key)
 
     def _color_changed(self, hex_):
         self.settings["color"] = hex_
@@ -625,15 +676,18 @@ class MainWindow(QMainWindow):
         self.cur = None
         self.undo_stack, self.redo_stack = [], []
         self.dirty = False
+        self.store = LayerStore()
+        self.canvas.set_store(self.store)
+        self.picked_layer = {}
         view = self.prefs.view_state(pl.data["id"])
-        self.hidden_stroke_authors = set(view.get("stroke_authors", []))
+        self.hidden_layers = set(view.get("layers", []))
         self.hidden_comment_authors = set(view.get("comment_authors", []))
-        self.hidden_strokes = set(view.get("strokes", []))
         self.hidden_comments = set(view.get("comments", []))
         self.prefs.push_file(pl.path)
         self.playlist_panel.setEnabled(True)
         self.playlist_panel.set_playlist(pl.name, pl.path)
         self._resolve_all()
+        converted = self._migrate()
         self._set_enabled(True)
         self.stack.setCurrentWidget(self.canvas)
         items = pl.items()
@@ -646,6 +700,20 @@ class MainWindow(QMainWindow):
         self._update_title()
         if missing:
             self.status.showMessage(f"{len(missing)} clip{'s' if len(missing) != 1 else ''} couldn't be found. Select one and relink it.", 8000)
+        elif converted:
+            self.status.showMessage(f"Converted this playlist's strokes into {converted} layer{'s' if converted != 1 else ''}. "
+                                    "Save to keep them.", 8000)
+
+    def _migrate(self) -> int:
+        """Bake strokes from version-1 playlists into layers. Returns the number of layers made."""
+        made = 0
+        for it in self.pl.items():
+            w, h = self._size(it["id"])
+            if w and h and any(not r.get("deleted") for r in it.get("strokes", {}).values()):
+                made += migrate(it, w, h)
+        if made:
+            self.dirty = True
+        return made
 
     def _resolve_all(self):
         maps = self.prefs.mappings
@@ -673,7 +741,7 @@ class MainWindow(QMainWindow):
             iid = it["id"]
             info = self.infos.get(iid) or it.get("info") or {}
             path = self.resolved.get(iid)
-            n = len(Playlist.live(it["strokes"])) + len(Playlist.live(it["comments"]))
+            n = len(Playlist.live(it.get("layers", {}))) + len(Playlist.live(it["comments"]))
             detail = f"{info.get('width', '?')}×{info.get('height', '?')}  {info.get('fps', 0):g} fps\n{info.get('frames', '?')} fr"
             rows.append({"id": iid, "label": it["label"], "detail": detail, "missing": path is None,
                          "path": path, "frames": info.get("frames", 1), "notes": n})
@@ -690,7 +758,7 @@ class MainWindow(QMainWindow):
         self.player.unload()
         self.canvas.set_source(0, 0)
         self.canvas.message = message
-        self.canvas.set_strokes([])
+        self.canvas.set_layers([], None)
         self.timeline.set_frames(1)
         self.timeline.set_marks({}, set())
         self.clip_info.setText("")
@@ -774,7 +842,7 @@ class MainWindow(QMainWindow):
         item = self.pl.item(iid) if self.pl else None
         if not item:
             return
-        n = len(Playlist.live(item["strokes"])) + len(Playlist.live(item["comments"]))
+        n = len(Playlist.live(item.get("layers", {}))) + len(Playlist.live(item["comments"]))
         msg = f"Remove “{item['label']}” from this playlist?"
         if n:
             msg += f"\n\nIts {n} note{'s' if n != 1 else ''} will be removed for everyone."
@@ -844,11 +912,11 @@ class MainWindow(QMainWindow):
 
     # ================================================================ frames
 
-    def _strokes_at(self, f: int) -> list[dict]:
+    def _layers_at(self, f: int) -> list[dict]:
         return self.by_frame.get(f, [])
 
     def _on_frame(self, i: int):
-        self.canvas.set_frame(i, self.player.image(i), self._strokes_at(i))
+        self.canvas.set_frame(i, self.player.image(i), self._layers_at(i), self._active_layer(i))
         self.timeline.set_current(i)
         self.tc.setText(f"{self._tc(i)}   <b>{i + 1}</b> / {self.player.frames}")
         if not self.player.playing:
@@ -856,7 +924,7 @@ class MainWindow(QMainWindow):
 
     def _on_image(self, i: int):
         if i == self.player.frame:
-            self.canvas.set_frame(i, self.player.image(i), self._strokes_at(i))
+            self.canvas.set_frame(i, self.player.image(i), self._layers_at(i), self._active_layer(i))
 
     def _on_playing(self, playing: bool):
         self.play_btn.setIcon(icon("pause" if playing else "play"))
@@ -891,10 +959,19 @@ class MainWindow(QMainWindow):
             self.player.pause()
             self.player.seek(target)
 
-    # ================================================================ notes
+    # ================================================================ layers & comments
 
     def _item(self):
         return self.pl.item(self.cur) if self.pl and self.cur else None
+
+    def _frame(self) -> int:
+        return self.player.frame if self.player.info else 0
+
+    def _size(self, iid: str | None = None) -> tuple[int, int]:
+        """An item's source resolution, which is its layers' resolution."""
+        iid = iid or self.cur
+        info = self.infos.get(iid) or ((self.pl.item(iid) or {}).get("info") if self.pl and iid else None) or {}
+        return info.get("width", 0), info.get("height", 0)
 
     def _visible_comments(self):
         it = self._item()
@@ -903,28 +980,43 @@ class MainWindow(QMainWindow):
         return [c for c in Playlist.live(it["comments"])
                 if c["author"] not in self.hidden_comment_authors and c["id"] not in self.hidden_comments]
 
-    def _stroke_visible(self, st: dict) -> bool:
-        return st["author"] not in self.hidden_stroke_authors and st["id"] not in self.hidden_strokes
+    def _pick_key(self, f: int) -> tuple:
+        return (self.cur, f, self.prefs.author)
+
+    def _active_layer(self, f: int | None = None) -> dict | None:
+        """The layer your strokes on frame f go into: the one you clicked, if it's yours, else
+        your top layer there. None means your next stroke makes a new layer on top."""
+        if not self._item():
+            return None
+        f = self._frame() if f is None else f
+        layers = self.all_by_frame.get(f, [])
+        me = self.prefs.author
+        picked = next((r for r in layers if r["id"] == self.picked_layer.get(self._pick_key(f))), None)
+        if picked is not None:
+            return picked if picked["author"] == me else None
+        mine = [r for r in layers if r["author"] == me]
+        return mine[-1] if mine else None
 
     def _refresh_notes(self):
         it = self._item()
         self.by_frame, self.all_by_frame = {}, {}
         marks: dict[int, list[str]] = {}
         if it:
-            for st in sorted(Playlist.live(it["strokes"]), key=lambda x: x["created"]):
-                self.all_by_frame.setdefault(st["frame"], []).append(st)
-                if not self._stroke_visible(st):
+            for r in sorted(Playlist.live(it.get("layers", {})), key=lambda x: (layer_order(x), x["created"])):
+                self.all_by_frame.setdefault(r["frame"], []).append(r)
+                if r["id"] in self.hidden_layers:
                     continue
-                self.by_frame.setdefault(st["frame"], []).append(st)
-                cols = marks.setdefault(st["frame"], [])
-                c = author_color(st["author"])
+                self.by_frame.setdefault(r["frame"], []).append(r)
+                cols = marks.setdefault(r["frame"], [])
+                c = author_color(r["author"])
                 if c not in cols:
                     cols.append(c)
             for f in self.all_by_frame:
-                marks.setdefault(f, [HIDDEN_MARK])  # frames whose strokes are all hidden show a grey mark
+                marks.setdefault(f, [HIDDEN_MARK])  # frames whose layers are all hidden show a grey mark
         self.timeline.set_marks(marks, {c["frame"] for c in self._visible_comments()})
         self.canvas.author = self.prefs.author
-        self.canvas.set_strokes(self._strokes_at(self.player.frame))
+        f = self.player.frame
+        self.canvas.set_layers(self._layers_at(f), self._active_layer(f))
         self._refresh_frame_panels()
         self.a_undo.setEnabled(bool(self.undo_stack))
         self.a_redo.setEnabled(bool(self.redo_stack))
@@ -937,70 +1029,155 @@ class MainWindow(QMainWindow):
             by.setdefault(r["author"], []).append(r)
         return sorted(by.items(), key=lambda kv: (kv[0] != me, kv[0].lower()))
 
-    def _stroke_label(self, st: dict) -> str:
-        label = TOOL_LABELS.get(st["kind"], st["kind"])
-        if st["kind"] == "smudge":
-            return f"{label}   Strength {round(st['opacity'] * 100)}%"
-        if st["kind"] == "text":
-            label += f" \u201c{st.get('text', '')[:18]}\u201d"
-        return f"{label}   {BLENDS.get(st['blend'], ('?',))[0]} {round(st['opacity'] * 100)}%"
+    def _layer_label(self, r: dict) -> str:
+        label = f"{r['name']}   {BLENDS.get(r['blend'], ('?',))[0]} {round(r.get('opacity', 1.0) * 100)}%"
+        return label if r["author"] == self.prefs.author else f"{label}   {r['author']}"
 
     @staticmethod
     def _comment_label(c: dict) -> str:
         return c["text"]
 
     def _refresh_frame_panels(self):
-        f = self.player.frame if self.player.info else 0
+        f = self._frame()
         me = self.prefs.author
-        self.stroke_tree.set_groups(self._groups(self.all_by_frame.get(f, []), me), self.hidden_stroke_authors,
-                                    self.hidden_strokes, me, self._stroke_label)
+        layers = self.all_by_frame.get(f, [])
+        active = self._active_layer(f)
+        picked = self.picked_layer.get(self._pick_key(f))
+        current = picked if any(r["id"] == picked for r in layers) else active and active["id"]
+        self.layers_panel.tree.set_layers(layers, current, self.hidden_layers, me, self._layer_label)
+        self.layers_panel.set_opacity(active.get("opacity", 1.0) if active else None)
+        if active is not None:
+            self.settings["blend"] = active["blend"]
+            self.blend.set_mode(active["blend"])
         it = self._item()
         comments = [c for c in Playlist.live(it["comments"]) if c["frame"] == f] if it else []
         self.comment_tree.set_groups(self._groups(comments, me), self.hidden_comment_authors,
                                      self.hidden_comments, me, self._comment_label)
         self.compose.set_frame(f)
 
-    def _author_toggled(self, name: str, kind: str, on: bool):
-        target = self.hidden_stroke_authors if kind == "strokes" else self.hidden_comment_authors
-        (target.discard if on else target.add)(name)
+    def pick_layer(self, lid: str):
+        if self._item():
+            self.picked_layer[self._pick_key(self._frame())] = lid
+            self._refresh_notes()
+
+    def _next_layer_name(self, f: int) -> str:
+        it = self._item()
+        n = sum(1 for r in it.get("layers", {}).values() if r["frame"] == f and r["author"] == self.prefs.author)
+        return f"Layer {n + 1}"
+
+    def new_layer(self):
+        if not self._item() or not self.player.info:
+            return
+        f = self._frame()
+        rec = self._make_layer(f)
+        self.picked_layer[self._pick_key(f)] = rec["id"]
+        self._record_changes([("layers", None, rec)])
+
+    def _make_layer(self, f: int) -> dict:
+        """A new layer of yours on top of frame f's layers."""
+        rec = make_layer(f, self.prefs.author, self._next_layer_name(f), self.settings["blend"])
+        top = max((layer_order(r) for r in self.all_by_frame.get(f, [])), default=rec["created"])
+        rec["order"] = max(rec["created"], top + 1)
+        return rec
+
+    def move_layers(self, ids: list[str], row: int):
+        """Move your layers among ids so they sit before `row` of the list (top first).
+
+        Only your own layers move: reordering rewrites a layer's record, and rewriting
+        someone else's could undo pixels they painted since your last merge. Yours can go
+        anywhere among theirs, since only your records change.
+        """
+        f = self._frame()
+        rows = list(reversed(self.all_by_frame.get(f, [])))  # top first
+        row = max(0, min(row, len(rows)))
+        moving = [r for r in rows if r["id"] in ids and r["author"] == self.prefs.author]
+        if not moving:
+            if ids:
+                self.status.showMessage("Only your own layers can be moved.", 4000)
+            return
+        row -= sum(1 for r in rows[:row] if r in moving)
+        rest = [r for r in rows if r not in moving]
+        above = rest[row - 1] if row > 0 else None
+        below = rest[row] if row < len(rest) else None
+        n = len(moving)
+        hi = layer_order(above) if above else (layer_order(below) + n + 1 if below else now())
+        lo = layer_order(below) if below else hi - n - 1
+        step = (hi - lo) / (n + 1)
+        changes = [("layers", copy.deepcopy(r), dict(r, order=hi - step * (k + 1))) for k, r in enumerate(moving)]
+        if [r["id"] for r in rest[:row] + moving + rest[row:]] != [r["id"] for r in rows]:
+            self._record_changes(changes)
+
+    def step_layers(self, ids: list[str], d: int):
+        """Move your selected layers one row up (d = -1) or down (d = 1)."""
+        rows = [r["id"] for r in reversed(self.all_by_frame.get(self._frame(), []))]
+        idx = [rows.index(i) for i in ids if i in rows]
+        if idx:
+            self.move_layers(ids, min(idx) - 1 if d < 0 else max(idx) + 2)
+
+    def _step_active(self, d: int):
+        a = self._active_layer()
+        if a is not None:
+            self.step_layers([a["id"]], d)
+
+    def _set_layer(self, rec: dict, **fields):
+        self._record_changes([("layers", copy.deepcopy(rec), dict(rec, **fields))])
+
+    def _opacity_pressed(self):
+        a = self._active_layer()
+        self._opacity_before = copy.deepcopy(a) if a else None
+
+    def _opacity_value(self, v: int):
+        a = self._active_layer()
+        if a is None:
+            return
+        if self.layers_panel.opacity.isSliderDown():
+            a["opacity"] = v / 100  # a preview while dragging; recorded on release
+            self.canvas.invalidate()
+        elif a.get("opacity", 1.0) != v / 100:
+            self._set_layer(a, opacity=v / 100)
+
+    def _opacity_released(self):
+        a, before = self._active_layer(), self._opacity_before
+        self._opacity_before = None
+        if a is not None and before is not None and before["id"] == a["id"] and before.get("opacity") != a.get("opacity"):
+            self._record_changes([("layers", before, dict(a))])
+
+    def _author_toggled(self, name: str, on: bool):
+        (self.hidden_comment_authors.discard if on else self.hidden_comment_authors.add)(name)
         self._save_view()
         self._refresh_notes()
 
     def _items_toggled(self, kind: str, ids: list[str], on: bool):
-        target = self.hidden_strokes if kind == "strokes" else self.hidden_comments
+        target = self.hidden_layers if kind == "layers" else self.hidden_comments
         for i in ids:
             (target.discard if on else target.add)(i)
         self._save_view()
         self._refresh_notes()
 
-    def _stroke_toggled(self, sid: str, on: bool):
-        self._items_toggled("strokes", [sid], on)
-
     def _save_view(self):
         if not self.pl:
             return
-        live_s, live_c = set(), set()
+        live_l, live_c = set(), set()
         for it in self.pl.items():
-            live_s |= {r["id"] for r in Playlist.live(it["strokes"])}
+            live_l |= {r["id"] for r in Playlist.live(it.get("layers", {}))}
             live_c |= {r["id"] for r in Playlist.live(it["comments"])}
-        self.hidden_strokes &= live_s  # forget notes that have since been deleted
+        self.hidden_layers &= live_l  # forget layers and notes that have since been deleted
         self.hidden_comments &= live_c
         self.prefs.set_view_state(self.pl.data["id"], {
-            "stroke_authors": sorted(self.hidden_stroke_authors),
+            "layers": sorted(self.hidden_layers),
             "comment_authors": sorted(self.hidden_comment_authors),
-            "strokes": sorted(self.hidden_strokes),
             "comments": sorted(self.hidden_comments),
         })
 
     def delete_records(self, kind: str, ids: list[str]):
-        """Delete the viewer's own strokes or comments among ids; others' can only be hidden."""
+        """Delete the viewer's own layers or comments among ids; others' can only be hidden."""
         it = self._item()
         if not it:
             return
         me = self.prefs.author
         changes = []
         for rid in ids:
-            rec = it[kind].get(rid)
+            rec = it.get(kind, {}).get(rid)
             if rec and rec["author"] == me and not rec.get("deleted"):
                 changes.append((kind, copy.deepcopy(rec), dict(rec, deleted=True)))
         skipped = len(ids) - len(changes)
@@ -1013,47 +1190,60 @@ class MainWindow(QMainWindow):
         elif changes:
             self.status.showMessage(f"Deleted {len(changes)} {noun}. Undo with \u2318/Ctrl+Z.", 3000)
         elif skipped:
-            self.status.showMessage("Only your own notes can be deleted. Uncheck others' notes to hide them.", 4000)
+            self.status.showMessage(f"Only your own {kind} can be deleted. Uncheck others' to hide them.", 4000)
+
+    def _put(self, iid: str, kind: str, rec: dict) -> dict:
+        if kind == "layers":
+            cur = self.pl.item(iid).get("layers", {}).get(rec["id"])
+            if cur is not None:  # pixels live in the layer store; changing a record never rewinds them
+                rec = dict(rec, png=cur.get("png", ""), x=cur.get("x", 0), y=cur.get("y", 0))
+        return self.pl.put_record(iid, kind, rec)
 
     def _record_changes(self, changes):
-        """changes: list of (kind, before, after) on the current item; applied and made undoable."""
+        """Apply changes to the current item and make them one undo step. Each change is either
+        (kind, record before or None, record after) or ("px", layer id, rect, pixels before, after),
+        for pixels already painted into the layer store."""
         iid = self.cur
         applied = []
-        for kind, before, after in changes:
-            rec = self.pl.put_record(iid, kind, after)
-            applied.append((iid, kind, before, rec))
+        for ch in changes:
+            if ch[0] == "px":
+                self.pl.item(iid)["layers"][ch[1]]["modified"] = now()
+                applied.append(("px", iid, *ch[1:]))
+            else:
+                kind, before, after = ch
+                applied.append(("rec", iid, kind, before, self._put(iid, kind, after)))
         self.undo_stack.append(applied)
+        del self.undo_stack[:-UNDO_LIMIT]
         self.redo_stack.clear()
         self._changed()
 
     def add_stroke(self, s: dict):
+        """Bake a finished stroke into your selected layer, or a new layer on top."""
         if not self._item():
             return
-        self._record_changes([("strokes", None, s)])
-        if s["kind"] != "smudge":  # a smudge carries no color of its own
-            self.color.render_recents(self.prefs.push_color(s["color"]))
-        if s["author"] in self.hidden_stroke_authors:
-            # Drawing while your own strokes are hidden would look like nothing happened.
-            self.hidden_stroke_authors.discard(s["author"])
-            self._save_view()
-            self._refresh_notes()
-            self.status.showMessage("Your strokes were hidden; showing them again", 3000)
-
-    def erase_strokes(self, ids: list[str]):
-        it = self._item()
-        if not it:
-            return
+        w, h = self._size()
+        target = self._active_layer(s["frame"])
         changes = []
-        for sid in ids:
-            rec = it["strokes"].get(sid)
-            if rec and rec["author"] == self.prefs.author and not rec.get("deleted"):
-                changes.append(("strokes", copy.deepcopy(rec), dict(rec, deleted=True)))
-        if changes:
-            self._record_changes(changes)
+        if target is None:
+            if s["kind"] in ("erase", "smudge"):
+                return
+            target = self._make_layer(s["frame"])
+            changes.append(("layers", None, target))
+        rect, before, after = self.store.bake(target, s, w, h)
+        changes.append(("px", target["id"], rect, before, after))
+        self.picked_layer[self._pick_key(s["frame"])] = target["id"]
+        if target["id"] in self.hidden_layers:
+            # Drawing on a hidden layer would look like nothing happened.
+            self.hidden_layers.discard(target["id"])
+            self._save_view()
+            self.status.showMessage(f"{target['name']} was hidden; showing it again", 3000)
+        self._record_changes(changes)
+        if s["kind"] not in ("smudge", "erase"):  # these carry no color of their own
+            self.color.render_recents(self.prefs.push_color(s["color"]))
 
     def clear_mine(self):
-        mine = [s["id"] for s in self._strokes_at(self.player.frame) if s["author"] == self.prefs.author]
-        self.erase_strokes(mine)
+        mine = [r["id"] for r in self.all_by_frame.get(self._frame(), []) if r["author"] == self.prefs.author]
+        self.delete_records("layers", mine)
 
     def add_comment(self, text: str):
         if not self._item():
@@ -1065,14 +1255,22 @@ class MainWindow(QMainWindow):
 
     def _apply_history(self, entry, undo: bool):
         frame = None
-        for iid, kind, before, after in (reversed(entry) if undo else entry):
-            if undo:
-                rec = dict(after, deleted=True) if before is None else before
+        for op in (reversed(entry) if undo else entry):
+            iid = op[1]
+            if op[0] == "px":
+                _, _, lid, rect, before, after = op
+                rec = self.pl.item(iid)["layers"][lid]
+                self.store.put_patch(rec, *self._size(iid), rect, before if undo else after)
+                rec["modified"] = now()
             else:
-                rec = after
-            self.pl.put_record(iid, kind, rec)
+                _, _, kind, before, after = op
+                if undo:
+                    rec = dict(after, deleted=True) if before is None else before
+                else:
+                    rec = after
+                rec = self._put(iid, kind, rec)
             frame = rec["frame"]
-        iid = entry[0][0]
+        iid = entry[0][1]
         if iid != self.cur and self.pl.item(iid):
             self.open_item(iid)
             self._refresh_playlist()
@@ -1106,6 +1304,7 @@ class MainWindow(QMainWindow):
         """Write the playlist (merged with the file on disk, so nobody's notes are overwritten)."""
         if not self.pl:
             return True
+        self.store.flush({lid: rec for it in self.pl.data["items"].values() for lid, rec in it.get("layers", {}).items()})
         try:
             incoming = self.pl.save()
         except PlaylistError as e:
@@ -1125,7 +1324,7 @@ class MainWindow(QMainWindow):
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Warning)
         box.setText(f"Save changes to \u201c{self.pl.name}\u201d?")
-        box.setInformativeText("Your strokes and comments since the last save will be lost if you don't save.")
+        box.setInformativeText("Your drawing and comments since the last save will be lost if you don't save.")
         box.setStandardButtons(QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard
                                | QMessageBox.StandardButton.Cancel)
         box.setDefaultButton(QMessageBox.StandardButton.Save)
@@ -1158,6 +1357,8 @@ class MainWindow(QMainWindow):
             self._update_title()
 
     def _after_merge(self):
+        if self._migrate():  # someone on an older version saved strokes
+            self._update_title()
         for it in self.pl.items():
             if it["id"] not in self.resolved:
                 self.resolved[it["id"]] = self.pl.resolve(it, self.prefs.mappings)
@@ -1187,8 +1388,8 @@ class MainWindow(QMainWindow):
             img = frame_to_qimage(f, self.player.info["width"], self.player.info["height"])
         finally:
             r.close()
-        strokes = self._strokes_at(self.player.frame) if self.canvas.show_marks else []
-        return self.canvas.render_full(img, strokes)
+        layers = self._layers_at(self.player.frame) if self.canvas.show_marks else []
+        return self.canvas.render_full(img, layers)
 
     def export_snapshot(self):
         it = self._item()
@@ -1233,6 +1434,86 @@ class MainWindow(QMainWindow):
                         self.open_item(cur)
                 self._refresh_notes()
                 self._refresh_playlist()
+
+    # ================================================================ updates
+
+    def check_updates(self, quiet: bool):
+        """Look for newer app code. Quietly (at startup) just says so in the status bar."""
+        if self._update_worker is not None:
+            return
+        if not quiet:
+            self.status.showMessage("Checking for updates…")
+        self._update_worker = w = UpdateWorker(install=False, parent=self)
+        w.done.connect(lambda r: self._update_checked(r, quiet))
+        w.start()
+
+    def _update_checked(self, r: dict, quiet: bool):
+        self._update_worker = None
+        state, msg = r["state"], r["message"]
+        if quiet:
+            if state == "available":
+                self.status.showMessage(f"{msg} Install it with Help \u25b8 Check for Updates.", 15000)
+            return
+        self.status.clearMessage()
+        if state == "error":
+            QMessageBox.warning(self, "Couldn't check for updates", msg)
+        elif state == "needs_full":
+            box = QMessageBox(QMessageBox.Icon.Information, "New version of the app needed", msg,
+                              QMessageBox.StandardButton.Close, self)
+            page = box.addButton("Open Download Page", QMessageBox.ButtonRole.AcceptRole)
+            box.exec()
+            if box.clickedButton() is page:
+                QDesktopServices.openUrl(QUrl(update.DOWNLOAD_PAGE))
+        elif state == "available":
+            ans = QMessageBox.question(self, "Update available",
+                                       f"{msg}\n\nYou're running {update.describe(update.running())}. Install the update? "
+                                       "It takes a few seconds and is used the next time BlendSketch starts.")
+            if ans == QMessageBox.StandardButton.Yes:
+                self.status.showMessage("Installing update…")
+                self._update_worker = w = UpdateWorker(install=True, parent=self)
+                w.done.connect(self._update_installed)
+                w.start()
+        else:
+            QMessageBox.information(self, "Updates", msg)
+
+    def _update_installed(self, r: dict):
+        self._update_worker = None
+        self.status.clearMessage()
+        if r["state"] != "installed":
+            QMessageBox.warning(self, "Update not installed", r["message"])
+            return
+        box = QMessageBox(QMessageBox.Icon.Information, "Update installed", r["message"],
+                          QMessageBox.StandardButton.NoButton, self)
+        restart = box.addButton("Restart Now", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Later", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is restart:
+            self.restart()
+
+    def restart(self):
+        """Quit (asking to save first) and start the app again, which picks up an installed update."""
+        if not self.maybe_save():
+            return
+        args = [a for a in sys.argv[1:] if not a.endswith(EXT)]
+        if self.pl:
+            args.append(self.pl.path)
+        if getattr(sys, "frozen", False):
+            QProcess.startDetached(sys.executable, args)
+        else:
+            QProcess.startDetached(sys.executable, [os.path.abspath(sys.argv[0]), *args])
+        self.dirty = False
+        QApplication.instance().quit()
+
+    def about(self):
+        info = update.running()
+        lines = [f"Version {update.describe(info)}"]
+        if info.get("commit"):
+            lines.append(f"Commit {info['commit'][:12]}")
+        nxt = update.installed()
+        if nxt and nxt.get("commit") != info.get("commit"):
+            lines.append(f"Update {nxt['version']} runs after a restart.")
+        QMessageBox.about(self, f"About {APP_NAME}", f"<b>{APP_NAME}</b><br>" + "<br>".join(lines) +
+                          "<br><br>Frame-accurate review with blend-mode layers and shared playlists.")
 
     def closeEvent(self, e):
         if not self.maybe_save():

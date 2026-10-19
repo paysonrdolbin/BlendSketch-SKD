@@ -70,6 +70,32 @@ def test_poll_picks_up_changes_and_flags_lost_writes():
     assert "sb" in a.item(item["id"])["strokes"] and "sa" in a.item(item["id"])["strokes"]
 
 
+def layer(author, frame, lid, png="", modified=None):
+    t = modified or time.time()
+    return {"id": lid, "frame": frame, "author": author, "created": t, "modified": t, "deleted": False, "name": "Layer 1",
+            "blend": "multiply", "opacity": 1.0, "png": png, "x": 0, "y": 0}
+
+
+def test_layers_merge_newest_wins_and_version_2():
+    d = tempfile.mkdtemp()
+    path = os.path.join(d, "p.bsplaylist")
+    a = Playlist.create(path, "P", "a")
+    item = a.add_item(os.path.join(d, "x.mov"), INFO, "a")
+    iid = item["id"]
+    a.put_record(iid, "layers", layer("a", 3, "la", "AAA"))
+    a.save()
+    b = Playlist.open(path)
+    b.put_record(iid, "layers", layer("b", 3, "lb", "BBB"))
+    time.sleep(0.01)
+    a.put_record(iid, "layers", dict(a.item(iid)["layers"]["la"], png="AAA2"))  # a paints more on their layer
+    a.save()
+    b.save()  # b's stale copy of a's layer must not win
+    on_disk = Playlist.open(path)
+    layers = on_disk.item(iid)["layers"]
+    assert layers["la"]["png"] == "AAA2" and layers["lb"]["png"] == "BBB"
+    assert on_disk.data["version"] == 2
+
+
 def test_order_keeps_items_added_concurrently():
     base = {"id": "p", "name": {"value": "n", "modified": 1}, "order": {"value": ["x"], "modified": 1},
             "items": {"x": {"id": "x", "modified": 1, "strokes": {}, "comments": {}}}}

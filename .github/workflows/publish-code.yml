@@ -1,0 +1,58 @@
+name: Publish app code
+
+# Every push to main publishes the blendsketch package to the `code-latest` release, where
+# `BlendSketch --update` (and Help ▸ Check for Updates) picks it up. The full apps are still
+# built by build.yml; an app only needs downloading again when requirements.txt changes.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-code
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          # The oldest Python any app is built with (Linux, Rocky 9), so code that compiles here runs everywhere.
+          python-version: "3.12"
+      - name: System libraries
+        # Qt's GUI module needs these even offscreen (the runner image doesn't have libEGL).
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+      - name: Tests
+        run: python -m pytest tests/test_playlist.py tests/test_update.py -q
+        env:
+          QT_QPA_PLATFORM: offscreen
+      - name: Zip the code
+        run: python packaging/make_code_zip.py out
+      - name: Publish to the code-latest release
+        # Run by hand on another branch, the workflow only tests and zips; only main is published.
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view code-latest >/dev/null 2>&1; then
+            gh release create code-latest --prerelease --target "$GITHUB_SHA" --title "App code (latest)" \
+              --notes "BlendSketch's code from the latest push to main, for the built-in updater. Download the app itself from the latest full release."
+          fi
+          # The zip first, then the manifest that points at it, so the updater never sees a manifest without its zip.
+          gh release upload code-latest out/blendsketch-code-*.zip --clobber
+          gh release upload code-latest out/code-manifest.json --clobber
+          # Keep the newest two zips (someone may be mid-download of the previous one).
+          gh release view code-latest --json assets -q '.assets | map(select(.name | startswith("blendsketch-code-"))) | sort_by(.createdAt) | reverse | .[2:] | .[].name' \
+            | while read -r name; do gh release delete-asset code-latest "$name" --yes; done

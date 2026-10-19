@@ -4,7 +4,20 @@ import os
 import sys
 
 sys.path.insert(0, SPECPATH)  # noqa: F821 (provided by PyInstaller)
+import subprocess
+import time
+
+import bootstrap
 from blendsketch import __version__
+
+# What this runtime is, for the updater: code downloaded later runs only on an app built from the
+# same requirements, and only if it's newer than the code built in here.
+_commit = os.environ.get("GITHUB_SHA") or subprocess.run(
+    ["git", "rev-parse", "HEAD"], cwd=SPECPATH, capture_output=True, text=True).stdout.strip()  # noqa: F821
+with open(os.path.join(SPECPATH, "blendsketch_runtime.py"), "w") as f:  # noqa: F821
+    f.write('"""Written by BlendSketch.spec at build time."""\n\nBUILD = ' + repr({
+        "version": f"{__version__}+{_commit[:7]}", "commit": _commit, "built": time.time(),
+        "requirements": bootstrap.requirements_hash(SPECPATH)}) + "\n")  # noqa: F821
 
 ICON = {"darwin": "packaging/icon.icns", "win32": "packaging/icon.ico"}.get(sys.platform, "packaging/icon.png")
 
@@ -13,7 +26,7 @@ a = Analysis(
     pathex=["."],
     # sg_helper.py runs under the pipeline's Python, so it ships as a file, not inside the archive.
     datas=[("packaging/icon.png", "packaging"), ("blendsketch/sg_helper.py", "blendsketch")],
-    hiddenimports=["PySide6.QtSvg", "PySide6.QtMultimedia"],
+    hiddenimports=["PySide6.QtSvg", "PySide6.QtMultimedia", "PySide6.QtNetwork", "blendsketch_runtime"],
     excludes=["tkinter", "PySide6.QtWebEngineCore", "PySide6.QtWebEngineWidgets", "PySide6.Qt3DCore",
               "PySide6.QtQuick", "PySide6.QtQml", "PySide6.QtCharts", "PySide6.QtDataVisualization",
               "PySide6.QtPdf", "PySide6.QtDesigner", "PySide6.QtBluetooth", "PySide6.QtLocation"],

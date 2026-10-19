@@ -1,10 +1,11 @@
 """Playlist files.
 
 A playlist is one JSON file (.bsplaylist). Footage is referenced by path, never embedded;
-strokes and comments live inside the file so anyone with the app and access to the
-folder can open it.
+layers (each a small PNG of what's painted on it) and comments live inside the file so
+anyone with the app and access to the folder can open it. Version 1 files stored every
+stroke instead of layers; layers.migrate converts them.
 
-Shared editing works by merging, never by locking. Every stroke, comment, item and
+Shared editing works by merging, never by locking. Every layer, comment, item and
 playlist field is a record with an id and a `modified` time. Deleting writes a tombstone
 (`deleted: true`) instead of removing the record, so a merge can't bring it back. Saving
 reads whatever is on disk, merges it with what's in memory (newest record wins), and
@@ -20,7 +21,7 @@ import time
 import uuid
 
 FORMAT = "blendsketch-playlist"
-VERSION = 1
+VERSION = 2
 EXT = ".bsplaylist"
 
 
@@ -52,11 +53,15 @@ def merge_records(mine: dict, theirs: dict) -> dict:
     return out
 
 
+RECORD_KINDS = ("layers", "comments", "strokes")  # strokes: version 1, kept as tombstones once converted
+
+
 def merge_item(a: dict, b: dict) -> dict:
     base = a if a.get("modified", 0) >= b.get("modified", 0) else b
-    item = {k: v for k, v in base.items() if k not in ("strokes", "comments")}
-    item["strokes"] = merge_records(a.get("strokes", {}), b.get("strokes", {}))
-    item["comments"] = merge_records(a.get("comments", {}), b.get("comments", {}))
+    item = {k: v for k, v in base.items() if k not in RECORD_KINDS}
+    for kind in RECORD_KINDS:
+        if kind in a or kind in b:
+            item[kind] = merge_records(a.get(kind, {}), b.get(kind, {}))
     return item
 
 
@@ -217,6 +222,7 @@ class Playlist:
                 merged = merge_playlists(self.data, disk)
                 incoming = canonical(merged) != canonical(self.data)
                 self.data = merged
+        self.data["version"] = VERSION
         folder = os.path.dirname(self.path)
         tmp = os.path.join(folder, f".{os.path.basename(self.path)}.{uuid.uuid4().hex[:8]}.tmp")
         try:
@@ -287,7 +293,7 @@ class Playlist:
             "deleted": False,
             "media": media_ref(path, self.folder),
             "info": info,
-            "strokes": {},
+            "layers": {},
             "comments": {},
         }
         self.data["items"][item["id"]] = item
@@ -323,13 +329,13 @@ class Playlist:
         """Store a copy of rec as the newest version (used for add, delete, undo and redo)."""
         rec = copy.deepcopy(rec)
         rec["modified"] = now()
-        self.data["items"][iid][kind][rec["id"]] = rec
+        self.data["items"][iid].setdefault(kind, {})[rec["id"]] = rec
         return rec
 
     def authors(self) -> dict[str, int]:
         counts: dict[str, int] = {}
         for item in self.items():
-            for kind in ("strokes", "comments"):
-                for r in self.live(item[kind]):
+            for kind in ("layers", "comments"):
+                for r in self.live(item.get(kind, {})):
                     counts[r["author"]] = counts.get(r["author"], 0) + 1
         return counts

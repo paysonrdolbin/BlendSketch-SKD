@@ -1,4 +1,4 @@
-"""The viewer: shows the current frame with its marks and handles drawing input."""
+"""The viewer: shows the current frame with its layers and handles drawing input."""
 
 from __future__ import annotations
 
@@ -8,17 +8,18 @@ from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen
 from PySide6.QtWidgets import QLineEdit, QWidget
 
+from . import layers as L
 from . import strokes as S
 from .colors import to_hex
 
-PAINT_TOOLS = ("pen", "brush")
+PAINT_TOOLS = ("pen", "brush", "erase")  # stroke kinds drawn live into a layer of their own
 SHAPE_TOOLS = ("line", "arrow", "rect", "ellipse")
 RING_TOOLS = ("pen", "brush", "smudge", "eraser")
 
 
 class Canvas(QWidget):
-    strokeCommitted = Signal(dict)
-    eraseCommitted = Signal(list)
+    strokeCommitted = Signal(dict)  # a finished stroke, for the window to bake into a layer
+    notice = Signal(str)
     colorPicked = Signal(str)
     decodeSizeWanted = Signal(int, int)
     zoomChanged = Signal(float)
@@ -33,27 +34,25 @@ class Canvas(QWidget):
         self.src_w, self.src_h = 0, 0
         self.frame_img: QImage | None = None
         self.frame_index = 0
-        self.strokes: list[dict] = []
+        self.layers: list[dict] = []           # this frame's visible layers, bottom to top
+        self.active: dict | None = None         # the layer strokes go into; None makes a new one on top
+        self.store: L.LayerStore = L.LayerStore()
         self.author = ""
         self.show_marks = True
         self.message = ""
         self.zoom = 1.0
         self.pan = QPointF(0, 0)
-        self.raster = S.RasterCache()
-        self._base: QImage | None = None       # footage + this frame's visible strokes
-        self._base_key: list | None = None      # ids of the strokes in _base, in order
-        self._base_src: QImage | None = None    # the frame image _base was built from
-        self._base_scale = 0.0
-        self._stack = None                      # S.LayerStack behind _base
-        self._smudge_done: str | None = None    # id of a smudge already applied to _stack live
+        self._disp: dict[str, tuple] = {}       # layer id -> (revision, size, image at frame_img size)
+        self._base: QImage | None = None        # footage + visible layers
+        self._base_key = None
+        self._below: QImage | None = None       # footage + the layers under the active one
+        self._above: list[dict] = []            # visible layers over the active one
         self._comp: QImage | None = None
         self.live: dict | None = None
         self._live_layer: QImage | None = None
         self._brush_state = {}
-        self._smudge_stack = None  # S.LayerStack while a smudge is being drawn
-        self._smudgers = []
-        self._footage: QImage | None = None
-        self._erasing: set | None = None
+        self._smudge_img: QImage | None = None  # a copy of the active layer, smudged live
+        self._smudger = None
         self._panning = None
         self._space = False
         self._mouse: QPointF | None = None
@@ -78,19 +77,25 @@ class Canvas(QWidget):
         self.src_w, self.src_h = w, h
         self.zoom, self.pan = 1.0, QPointF(0, 0)
         self.frame_img = None
-        self.raster.clear()
+        self._disp.clear()
         self.invalidate()
         self._size_timer.start(0)
 
-    def set_frame(self, index: int, img: QImage | None, strokes: list[dict]):
+    def set_frame(self, index: int, img: QImage | None, layers: list[dict], active: dict | None):
         self.frame_index = index
         if img is not None:
             self.frame_img = img
-        self.strokes = strokes
+        self.layers, self.active = layers, active
         self.invalidate()
 
-    def set_strokes(self, strokes: list[dict]):
-        self.strokes = strokes
+    def set_store(self, store: L.LayerStore):
+        self.store = store
+        self._disp.clear()
+        self._base = self._base_key = None
+        self.invalidate()
+
+    def set_layers(self, layers: list[dict], active: dict | None):
+        self.layers, self.active = layers, active
         self.invalidate()
 
     def invalidate(self):
@@ -164,47 +169,51 @@ class Canvas(QWidget):
 
     # ------------------------------------------------------------ compositing
 
-    def _visible_strokes(self):
-        if not self.show_marks:
-            return []
-        if self._erasing:
-            return [s for s in self.strokes if s["id"] not in self._erasing]
-        return self.strokes
+    def _visible_layers(self) -> list[dict]:
+        return self.layers if self.show_marks else []
+
+    def _layer_image(self, rec: dict) -> QImage:
+        """A layer's pixels at the decode size, rescaled only when they change."""
+        full = self.store.get(rec, self.src_w, self.src_h)
+        size = self.frame_img.size()
+        rev = self.store.rev(rec["id"])
+        hit = self._disp.get(rec["id"])
+        if hit and hit[0] == rev and hit[1] == size:
+            return hit[2]
+        img = full if full.size() == size else full.scaled(size, Qt.AspectRatioMode.IgnoreAspectRatio,
+                                                            Qt.TransformationMode.SmoothTransformation)
+        self._disp[rec["id"]] = (rev, size, img)
+        return img
+
+    def _active_index(self, layers) -> int | None:
+        if self.active is None:
+            return None
+        return next((i for i, r in enumerate(layers) if r["id"] == self.active["id"]), None)
 
     def _ensure_base(self):
-        """Bring _base up to date. Adding strokes on top (the usual case) only draws the new
-        strokes; a full rebuild, which re-runs every smudge, happens only when strokes are
-        removed, hidden or reordered, or the frame or zoom changes."""
-        strokes = self._visible_strokes()
-        key = [s["id"] for s in strokes]
-        scale = self._img_scale()
-        same = self._base is not None and self._base_src is self.frame_img and self._base_scale == scale
-        if same and key == self._base_key:
+        """Composite the visible layers onto the frame. Costs one blend per layer, however many
+        strokes went into them, and only reruns when a layer, its settings or the frame change."""
+        layers = self._visible_layers()
+        imgs = [self._layer_image(r) for r in layers]
+        key = (self.frame_img.cacheKey(), self.frame_img.size(), self.active and self.active["id"],
+               [(r["id"], self.store.rev(r["id"]), r["blend"], r.get("opacity", 1.0)) for r in layers])
+        if self._base is not None and key == self._base_key:
             return
-        pending, self._smudge_done = self._smudge_done, None
-        n = len(self._base_key) if self._base_key is not None else -1
-        if same and n >= 0 and key[:n] == self._base_key and (pending is None or pending in key[n:]):
-            new = strokes[n:]
-            if any(s["kind"] == "smudge" for s in new):
-                for s in new:
-                    if s["id"] != pending:  # a smudge drawn live is already in the stack
-                        self._stack.push(s)
-                base = self.frame_img.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
-                self._stack.draw(base)
-                self._base = base
-            else:
-                for s in new:
-                    self._stack.push(s)
-                S.composite(self._base, new, scale, self.raster)  # just the new strokes, on top
+        ai = self._active_index(layers)
+        split = len(layers) if ai is None else ai
+        below = self.frame_img.convertToFormat(L.FMT)
+        for r, img in zip(layers[:split], imgs[:split]):
+            L.blend_onto(below, img, r)
+        if ai is None:
+            self._below, self._above, self._base = None, [], below
         else:
-            stack = S.LayerStack(self.frame_img.size(), scale, self.raster)
-            for s in strokes:
-                stack.push(s)
-            base = self.frame_img.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
-            stack.draw(base)
-            self._stack, self._base = stack, base
-        self._base_key, self._base_src, self._base_scale = key, self.frame_img, scale
+            base = below.copy()
+            for r, img in zip(layers[ai:], imgs[ai:]):
+                L.blend_onto(base, img, r)
+            self._below, self._above, self._base = below, layers[ai + 1:], base
+        self._base_key = key
         self._comp = None
+        self.store.trim({r["id"] for r in self.layers})
 
     def composite_image(self) -> QImage | None:
         if self.frame_img is None:
@@ -212,27 +221,37 @@ class Canvas(QWidget):
         self._ensure_base()
         if self.live is None:
             return self._base
-        if self.live["kind"] == "smudge":
-            if self._comp is None:
-                out = self._footage.copy()
-                self._smudge_stack.draw(out)
-                self._comp = out
-            return self._comp
         if self._comp is None:
-            out = self._base.copy()
-            if self.live["kind"] in PAINT_TOOLS and self._live_layer is not None:
-                S.composite_layer(out, self._live_layer, self.live)
+            self._comp = self._compose_live()
+        return self._comp
+
+    def _compose_live(self) -> QImage:
+        """The frame with the stroke being drawn shown inside its layer, under any layers above."""
+        s = self.live
+        k = self._img_scale()
+        inside = self._below is not None  # the stroke goes into a visible layer (else a new one on top)
+        out = (self._below if inside else self._base).copy()
+        if s["kind"] == "smudge":
+            layer = self._smudge_img
+        else:
+            layer = self._layer_image(self.active).copy() if inside else L.blank(out.width(), out.height())
+            g = QPainter(layer)
+            if s["kind"] == "erase":
+                g.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationOut)
+            g.setOpacity(s["opacity"])
+            if s["kind"] in PAINT_TOOLS and self._live_layer is not None:
+                g.drawImage(0, 0, self._live_layer)
             else:
-                hit = S.rasterize(self.live, self._img_scale())
+                hit = S.rasterize(s, k)
                 if hit:
                     img, x, y = hit
-                    g = QPainter(out)
-                    g.setCompositionMode(S.BLENDS[self.live["blend"]][1])
-                    g.setOpacity(self.live["opacity"])
                     g.drawImage(x, y, img)
-                    g.end()
-            self._comp = out
-        return self._comp
+            g.end()
+        L.blend_onto(out, layer, self.active or {"blend": self.settings["blend"], "opacity": 1.0})
+        if inside:
+            for r in self._above:
+                L.blend_onto(out, self._layer_image(r), r)
+        return out
 
     def paintEvent(self, e):
         p = QPainter(self)
@@ -366,29 +385,24 @@ class Canvas(QWidget):
         if tool == "text":
             self._open_text(pos, pt)
             return
-        if tool == "eraser":
-            self._erasing = set()
-            self._erase_at(x, y)
+        if tool in ("eraser", "smudge") and self.active is None:
+            self.notice.emit(f"No layer of yours to {'erase' if tool == 'eraser' else 'smudge'} on this frame. "
+                             "Draw something first, or pick one of your layers.")
             return
         st = dict(self.settings)
         st["size"] = self.settings["sizes"][tool]
-        if tool == "smudge":
-            # The smudge works on this frame's stroke layers, never the footage. It reuses the
-            # layers behind the current image, so earlier smudges aren't re-run.
-            self._ensure_base()
-            self.live = S.make_stroke(tool, self.frame_index, self.author, st, pt)
+        kind = "erase" if tool == "eraser" else tool
+        if kind == "erase":
+            st["color"], st["opacity"] = "#000000", 1.0
+        self.live = S.make_stroke(kind, self.frame_index, self.author, st, pt)
+        if kind == "smudge":
+            # The smudge works on the active layer's pixels, never the footage or other layers.
             self.live["blend"] = "normal"
-            self._footage = self.frame_img.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
-            stack = self._stack
-            self._smudge_stack = stack
-            self._smudgers = stack.smudgers(self.live)
-            for sm in self._smudgers:
-                sm.advance()
-            self._comp = None
-            self.update()
-            return
-        self.live = S.make_stroke(tool, self.frame_index, self.author, st, pt)
-        if tool in PAINT_TOOLS:
+            self._ensure_base()
+            self._smudge_img = self._layer_image(self.active).copy()
+            self._smudger = S.Smudger(self._smudge_img, self.live, self._img_scale())
+            self._smudger.advance()
+        elif kind in PAINT_TOOLS:
             k = self._img_scale()
             layer = QImage(self.frame_img.width(), self.frame_img.height(), QImage.Format.Format_ARGB32_Premultiplied)
             layer.fill(Qt.GlobalColor.transparent)
@@ -396,10 +410,10 @@ class Canvas(QWidget):
             g.setRenderHint(QPainter.RenderHint.Antialiasing)
             g.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
             g.scale(k, k)
-            if tool == "pen":
-                S.pen_dot(g, self.live)
-            else:
+            if kind == "brush":
                 S.brush_start(g, self.live, self._brush_state)
+            else:
+                S.pen_dot(g, self.live)
             g.end()
             self._live_layer = layer
         else:
@@ -419,10 +433,6 @@ class Canvas(QWidget):
             self.update()
             return
         self._pick = None
-        if self._erasing is not None:
-            self._erase_at(*self.to_src(pos))
-            self.update()
-            return
         if self.live is None:
             if self.tool in RING_TOOLS:
                 self.update()
@@ -433,8 +443,7 @@ class Canvas(QWidget):
             last = s["pts"][-1]
             if math.hypot(x - last[0], y - last[1]) >= 0.75 / max(self._scale(), 0.01):
                 s["pts"].append([x, y, pressure])
-                for sm in self._smudgers:
-                    sm.advance()
+                self._smudger.advance()
                 self._comp = None
                 self.update()
             return
@@ -448,10 +457,10 @@ class Canvas(QWidget):
             g.setRenderHint(QPainter.RenderHint.Antialiasing)
             g.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
             g.scale(k, k)
-            if s["kind"] == "pen":
-                S.pen_seg(g, s, len(s["pts"]) - 1)
-            else:
+            if s["kind"] == "brush":
                 S.brush_seg(g, s, len(s["pts"]) - 1, self._brush_state)
+            else:
+                S.pen_seg(g, s, len(s["pts"]) - 1)
             g.end()
         else:
             if mods & Qt.KeyboardModifier.ShiftModifier:
@@ -476,38 +485,18 @@ class Canvas(QWidget):
             self.unsetCursor()
             self._size_timer.start()
             return
-        if self._erasing is not None:
-            ids = list(self._erasing)
-            self._erasing = None
-            if ids:
-                self.eraseCommitted.emit(ids)
-            self.invalidate()
-            return
         s = self.live
         if s is None:
             return
         self.live = None
         self._live_layer = None
-        self._smudge_stack = None
-        self._smudgers = []
-        self._footage = None
+        self._smudge_img = None
+        self._smudger = None
         self._comp = None
-        if s["kind"] == "smudge":
-            self._smudge_done = s["id"]  # already applied to the stack while drawing
         if s["kind"] not in PAINT_TOOLS + ("smudge",) and math.hypot(s["pts"][0][0] - s["pts"][1][0], s["pts"][0][1] - s["pts"][1][1]) < 3:
             self.update()
             return
         self.strokeCommitted.emit(S.tidy(s))
-
-    def _erase_at(self, x, y):
-        r = self.settings["sizes"]["eraser"] / 2
-        for s in self.strokes:
-            if s["author"] != self.author:  # the eraser only removes your own marks
-                continue
-            if s["id"] not in self._erasing and S.hit(s, x, y, r):
-                self._erasing.add(s["id"])
-                self._base_key = None  # erasing: rebuild without the hit strokes
-        self._comp = None
 
     def mousePressEvent(self, e):
         if self._tablet:
@@ -620,10 +609,14 @@ class Canvas(QWidget):
 
     # ------------------------------------------------------------ export
 
-    def render_full(self, frame_img: QImage, strokes) -> QImage:
-        """Composite marks onto a full-resolution frame (for snapshots)."""
-        out = frame_img.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
-        S.composite(out, strokes, out.width() / self.src_w, S.RasterCache())
+    def render_full(self, frame_img: QImage, layers) -> QImage:
+        """Composite layers onto a full-resolution frame (for snapshots)."""
+        out = frame_img.convertToFormat(L.FMT)
+        for r in layers:
+            img = self.store.get(r, self.src_w, self.src_h)
+            if img.size() != out.size():
+                img = img.scaled(out.size(), Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            L.blend_onto(out, img, r)
         return out
 
     def sizeHint(self):

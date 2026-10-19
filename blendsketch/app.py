@@ -179,6 +179,9 @@ def check(paths: list[str]) -> int:
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--check":
         sys.exit(check(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] in ("--update", "--version"):
+        from .update import cli
+        sys.exit(cli(sys.argv[1:]))
     os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
     app = App(sys.argv)
     app.setApplicationName(APP_NAME)

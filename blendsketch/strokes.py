@@ -1,10 +1,10 @@
-"""Stroke records, rasterizing and blend-mode compositing.
+"""Strokes: drawing them, and the blend modes layers composite with.
 
-A stroke is a plain dict (it lives in the playlist JSON). Points are in source-pixel
-coordinates so marks line up at any decode or display resolution. Each stroke is
-rasterized once at full opacity into its own layer, then composited onto the frame with
-its blend mode and opacity, so a semi-transparent Multiply stroke doesn't darken where it
-crosses itself.
+A stroke is a plain dict that lives only while it's being drawn; when it's finished it's
+painted into a layer (see layers.py) and not kept. Points are in source-pixel coordinates
+so marks line up at any decode or display resolution. A stroke is rasterized at full
+opacity, then painted into its layer at the stroke's opacity, so a semi-transparent stroke
+doesn't darken where it crosses itself.
 """
 
 from __future__ import annotations
@@ -35,8 +35,6 @@ BLENDS = {
     "exclusion": ("Exclusion", CM.CompositionMode_Exclusion),
 }
 MAIN_BLENDS = ("normal", "multiply", "screen")
-TOOL_LABELS = {"pen": "Pen", "brush": "Brush", "smudge": "Smudge", "line": "Line", "arrow": "Arrow", "rect": "Rect",
-               "ellipse": "Ellipse", "text": "Text"}
 TEXT_FAMILY = "Helvetica Neue"
 
 
@@ -185,7 +183,7 @@ def paint(g: QPainter, s: dict):
     P = s["pts"]
     kind = s["kind"]
     color = QColor(s["color"])
-    if kind == "pen":
+    if kind in ("pen", "erase"):
         pen_dot(g, s)
         for i in range(1, len(P)):
             pen_seg(g, s, i)
@@ -244,27 +242,6 @@ def bbox(s: dict) -> QRectF:
     return QRectF(min(xs) - pad, min(ys) - pad, max(xs) - min(xs) + pad * 2, max(ys) - min(ys) + pad * 2)
 
 
-class RasterCache:
-    """Per-stroke layers at a given render scale, keyed by stroke id and modified time."""
-
-    def __init__(self):
-        self.d = {}
-
-    def get(self, s: dict, scale: float):
-        key = (s["id"], s.get("modified"), round(scale, 4))
-        hit = self.d.get(key)
-        if hit is None:
-            hit = rasterize(s, scale)
-            self.d[key] = hit
-            if len(self.d) > 4000:
-                self.d.clear()
-                self.d[key] = hit
-        return hit
-
-    def clear(self):
-        self.d.clear()
-
-
 def rasterize(s: dict, scale: float):
     r = bbox(s)
     x0, y0 = math.floor(r.left() * scale), math.floor(r.top() * scale)
@@ -281,71 +258,6 @@ def rasterize(s: dict, scale: float):
     return img, x0, y0
 
 
-def composite(target: QImage, strokes, scale: float, cache: RasterCache):
-    """Blend each stroke onto target (an image at `scale` x source resolution)."""
-    if any(s["kind"] == "smudge" for s in strokes):
-        stack = LayerStack(target.size(), scale, cache)
-        for s in strokes:
-            stack.push(s)
-        stack.draw(target)
-        return
-    g = QPainter(target)
-    for s in strokes:
-        hit = cache.get(s, scale)
-        if hit is None:
-            continue
-        img, x, y = hit
-        g.setCompositionMode(BLENDS.get(s["blend"], BLENDS["normal"])[1])
-        g.setOpacity(s["opacity"])
-        g.drawImage(x, y, img)
-    g.end()
-
-
-def composite_layer(target: QImage, layer: QImage, s: dict):
-    g = QPainter(target)
-    g.setCompositionMode(BLENDS.get(s["blend"], BLENDS["normal"])[1])
-    g.setOpacity(s["opacity"])
-    g.drawImage(0, 0, layer)
-    g.end()
-
-
-# ---------------------------------------------------------------- hit testing
-
-def hit(s: dict, x: float, y: float, r: float) -> bool:
-    tol = r + s["size"] / 2
-    P = s["pts"]
-
-    def seg_d(a, b):
-        dx, dy = b[0] - a[0], b[1] - a[1]
-        L = dx * dx + dy * dy
-        t = max(0.0, min(1.0, ((x - a[0]) * dx + (y - a[1]) * dy) / L)) if L else 0.0
-        return math.hypot(x - a[0] - t * dx, y - a[1] - t * dy)
-
-    k = s["kind"]
-    if k in ("pen", "brush", "smudge"):
-        if len(P) == 1:
-            return math.hypot(x - P[0][0], y - P[0][1]) < tol
-        return any(seg_d(P[i - 1], P[i]) < tol for i in range(1, len(P)))
-    if k in ("line", "arrow"):
-        return seg_d(P[0], P[1]) < tol
-    if k == "rect":
-        a, b = P
-        x0, x1, y0, y1 = min(a[0], b[0]), max(a[0], b[0]), min(a[1], b[1]), max(a[1], b[1])
-        inside = x0 - tol < x < x1 + tol and y0 - tol < y < y1 + tol
-        if s["fill"]:
-            return inside
-        return inside and not (x0 + tol < x < x1 - tol and y0 + tol < y < y1 - tol)
-    if k == "ellipse":
-        a, b = P
-        cx, cy = (a[0] + b[0]) / 2, (a[1] + b[1]) / 2
-        rx, ry = max(1, abs(a[0] - b[0]) / 2), max(1, abs(a[1] - b[1]) / 2)
-        d = math.hypot((x - cx) / rx, (y - cy) / ry)
-        return d <= 1 + tol / min(rx, ry) if s["fill"] else abs(d - 1) * min(rx, ry) < tol
-    if k == "text":
-        return bbox(s).adjusted(-r, -r, r, r).contains(QPointF(x, y))
-    return False
-
-
 # ---------------------------------------------------------------- smudge
 
 def image_array(img: QImage) -> np.ndarray:
@@ -358,7 +270,8 @@ def image_array(img: QImage) -> np.ndarray:
 class Smudger:
     """Procreate-style smudge: the brush picks up the pixels under it and drags them along.
 
-    Each dab blends the paint it's carrying into the image under a soft round mask, then
+    Works on one layer's pixels, never the footage. Each dab blends the paint it's carrying
+    into the image under a soft round mask, then
     carries the result forward, so the smear fades out over the length of the stroke.
     Strength comes from the stroke's opacity, scaled by pen pressure.
     Works in premultiplied ARGB, which is what keeps edges from going dark.
@@ -424,58 +337,3 @@ class Smudger:
 
     def run(self):
         self.advance()
-
-
-class LayerStack:
-    """The frame's strokes as separate layers, so a smudge can move paint without touching the footage.
-
-    Each stroke keeps its own layer and blend mode. A smudge smears the paint of every layer
-    beneath it that it touches (each with its own carry), then the layers are blended onto the
-    frame in order as usual. A smudge over bare footage does nothing.
-    """
-
-    def __init__(self, size, scale: float, cache: RasterCache):
-        self.w, self.h = size.width(), size.height()
-        self.scale, self.cache = scale, cache
-        self.layers: list[list] = []  # [image, x, y, stroke, owned]
-
-    def push(self, s: dict):
-        if s["kind"] == "smudge":
-            for sm in self.smudgers(s, self._reach(s)):
-                sm.run()
-            return
-        hit = self.cache.get(s, self.scale)
-        if hit:
-            img, x, y = hit
-            self.layers.append([img, x, y, s, False])
-
-    def _reach(self, s: dict) -> QRectF:
-        k = self.scale
-        r = bbox(s)
-        return QRectF(r.left() * k, r.top() * k, r.width() * k, r.height() * k)
-
-    def smudgers(self, s: dict, reach: QRectF | None = None) -> list:
-        """Smudgers for the layers a smudge can reach (all of them when reach is None),
-        promoting each to a full-frame layer of its own so paint can move outside its old bounds."""
-        out = []
-        for layer in self.layers:
-            img, x, y = layer[0], layer[1], layer[2]
-            if reach is not None and not reach.intersects(QRectF(x, y, img.width(), img.height())):
-                continue
-            if not layer[4]:
-                full = QImage(self.w, self.h, QImage.Format.Format_ARGB32_Premultiplied)
-                full.fill(Qt.GlobalColor.transparent)
-                g = QPainter(full)
-                g.drawImage(x, y, img)
-                g.end()
-                layer[0], layer[1], layer[2], layer[4] = full, 0, 0, True
-            out.append(Smudger(layer[0], s, self.scale))
-        return out
-
-    def draw(self, target: QImage):
-        g = QPainter(target)
-        for img, x, y, s, _ in self.layers:
-            g.setCompositionMode(BLENDS.get(s["blend"], BLENDS["normal"])[1])
-            g.setOpacity(s["opacity"])
-            g.drawImage(x, y, img)
-        g.end()

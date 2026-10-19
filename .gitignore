@@ -6,3 +6,4 @@ dist/
 testdata/
 packaging/icon.iconset/
 .DS_Store
+blendsketch_runtime.py
