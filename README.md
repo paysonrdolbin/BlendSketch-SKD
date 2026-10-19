@@ -67,6 +67,15 @@ BlendSketch-SKD is BlendSketch plus SKD Open Playlist. To bring in BlendSketch's
 Pushing publishes the code SKD's in-app updater installs. On a conflict the script stops with
 the merge in progress; keep SKD's side of its own changes, commit, and run it again.
 
+## Deploying to the sandwich share
+
+    ./deploy.sh
+
+builds the app and copies it to `/job/sandwich/06_software/BlendSketch-SKD`, which everyone
+runs from. Artists add it to their applications menu once, by double-clicking
+"Install BlendSketch" in `06_software` (or running `install_launcher.sh` in the app folder);
+after that each redeploy reaches them on their next launch.
+
 ## How footage is found
 
 Each clip stores a path relative to the playlist file and the absolute path it was added from. When a playlist opens, BlendSketch tries, in order:
