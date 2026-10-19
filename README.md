@@ -2,9 +2,9 @@
 
 Frame-accurate review for footage, with Procreate-style layers that blend (Multiply, Screen, Overlay and ten more), a smudge brush, and shared playlist files.
 
-**Layers.** Each frame's drawing lives in layers. A stroke is baked into the selected layer when you finish it, so a frame with hundreds of strokes draws as fast as one with a few. The blend mode and opacity belong to the layer: change them and the whole layer changes. Your first stroke on a frame makes a layer; **+** under the layer list (or Edit ▸ New Layer, ⇧⌘/Ctrl+Shift+N) adds another on top. You draw on (and reorder) your own layers only; clicking someone else's selects it so you can hide it, and your next stroke then starts a new layer of yours on top.
+**Layers.** Each frame's drawing lives in layers. A stroke is baked into the selected layer when you finish it, so a frame with hundreds of strokes draws as fast as one with a few. The blend mode and opacity belong to the layer. Picking a different blend mode (the blend buttons, or 1 2 3) starts a new layer in that mode on top, unless your selected layer is still empty, in which case it just switches. To change a layer's mode afterwards, click the mode button on its row in the layer list. Starting to draw on a frame where you have no layer makes one; **+** under the layer list (or Edit ▸ New Layer, ⇧⌘/Ctrl+Shift+N) adds another on top. You draw on (and reorder) your own layers only; clicking someone else's selects it so you can hide it, and your next stroke then starts a new layer of yours on top.
 
-The **eraser** (E) erases pixels from your selected layer. The **smudge** tool (S) picks up the selected layer's pixels under the brush and drags them along; the opacity slider becomes its strength, and pen pressure scales it. Neither touches the footage or other layers.
+The **eraser** (E) erases pixels from your selected layer. The **smudge** tool (S) picks up the selected layer's pixels under the brush and drags them along; the opacity slider becomes its strength, and pen pressure scales it. Neither touches the footage or other layers, and using either on an empty layer shows a reminder of which tool you're on.
 
 - **Plays ProRes directly.** FFmpeg (through PyAV) is built in, so ProRes 422/4444, DNxHR, H.264 (including 10-bit and 4:2:2), HEVC, image sequences' single frames and most other formats play with no proxies or conversion.
 - **Playlists are files.** A `.bsplaylist` holds the clip list plus every layer (as a PNG cropped to what's painted) and comment. Footage is referenced by path, not copied in. A lightly marked-up playlist is tens of kilobytes; each heavily painted full frame adds a megabyte or two.
@@ -82,7 +82,7 @@ Layers                         Comments
 ☐ ● Layer 1   Multiply 70%     ☑ lead   1
 ```
 
-- Click one of your layers to draw on it; the selected layer is bold, and the blend mode and opacity controls edit it.
+- Click one of your layers to draw on it; the selected layer is bold. Its row's mode button and the Opacity slider under the list change it.
 - Drag your layers to reorder them, or right-click ▸ Move up / Move down (⇧⌘/Ctrl+Shift+↑ ↓ for the selected layer). You can put yours anywhere among other people's layers, but only move your own.
 - A layer's checkbox shows or hides it. For comments, a person's checkbox hides all of theirs, on every frame. Hiding is saved per playlist on your machine and never changes the file, so you can hide anyone's.
 - Select several (Shift- or ⌘/Ctrl-click). Clicking the checkbox of any selected row shows or hides all of them. Press Delete/Backspace, or right-click ▸ Delete. Only your own layers and comments are deleted; other people's are skipped and can only be hidden. ⌘/Ctrl+Z undoes a delete, a stroke, an erase or a smudge. Edit ▸ Delete My Layers on This Frame follows the same rule.
@@ -95,7 +95,7 @@ Playlists saved by earlier versions stored every stroke separately. Opening one 
 | --- | --- | --- | --- |
 | P B S L A R O T E | Pen, brush, smudge, line, arrow, rect, ellipse, text, eraser | Space | Play / pause |
 | I, or hold Alt/Option | Eyedropper | ← → | Previous / next frame |
-| 1 2 3 | Layer blend: Normal, Multiply, Screen | Shift+← → | Previous / next noted frame |
+| 1 2 3 | Draw in Normal, Multiply, Screen (a new layer) | Shift+← → | Previous / next noted frame |
 | [ ] | Brush size | ↑ ↓ | Previous / next clip |
 | H | Show / hide marks | Home / End | First / last frame |
 | F, ⌘/Ctrl+1 | Fit, actual pixels | M | Mute |

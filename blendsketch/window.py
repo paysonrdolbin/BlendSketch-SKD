@@ -26,7 +26,7 @@ from .panels import ComposeBox, LayersPanel, NotesTree, PlaylistPanel, PrefsDial
 from .playlist import EXT, Playlist, PlaylistError, find_by_name, new_id, now
 from .prefs import Prefs
 from .skd_dialog import SKDOpenDialog, Worker
-from .strokes import BLENDS, MAIN_BLENDS
+from .strokes import MAIN_BLENDS
 from .timeline import Timeline
 from .widgets import BlendPanel, BrushPanel, ColorPanel, section_label
 
@@ -91,7 +91,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.prefs = prefs
         self.settings = {
-            "tool": "brush", "color": "#6f7fb8", "blend": "multiply", "opacity": 0.8, "pressure": True, "fill": False,
+            "tool": "brush", "color": "#6f7fb8", "blend": "multiply", "opacity": 1.0, "pressure": True, "fill": False,
             "sizes": {"pen": 6, "brush": 80, "smudge": 60, "line": 5, "arrow": 5, "rect": 5, "ellipse": 5, "text": 8, "eraser": 30},
         }
         self.prev_tool = "brush"
@@ -110,6 +110,7 @@ class MainWindow(QMainWindow):
         self.dirty = False
         self.store = LayerStore()                # every layer's pixels
         self.picked_layer: dict[tuple, str] = {}  # (item, frame, you) -> the layer you last clicked there
+        self._pending_layer: dict | None = None   # made when a stroke started; recorded when it's finished
         self._opacity_before: dict | None = None
         self.by_frame: dict[int, list] = {}      # visible layers, bottom to top
         self.all_by_frame: dict[int, list] = {}  # every live layer, hidden or not
@@ -438,7 +439,8 @@ class MainWindow(QMainWindow):
         self.player.error.connect(lambda m: self.status.showMessage(m, 6000))
         self.canvas.decodeSizeWanted.connect(self.player.set_size)
         self.canvas.strokeCommitted.connect(self.add_stroke)
-        self.canvas.notice.connect(lambda m: self.status.showMessage(m, 4000))
+        self.canvas.layerWanted.connect(self._begin_layer)
+        self.canvas.strokeCancelled.connect(self._drop_pending_layer)
         self.canvas.colorPicked.connect(self._picked)
         self.canvas.zoomChanged.connect(lambda z: self.zoom_label.setText("Fit" if abs(z - 1) < 1e-3 else f"{z * 100:.0f}% of fit"))
         self.timeline.seek.connect(self.goto)
@@ -455,6 +457,7 @@ class MainWindow(QMainWindow):
         lp.tree.deleteRequested.connect(lambda ids: self.delete_records("layers", ids))
         lp.tree.moveRequested.connect(self.move_layers)
         lp.tree.stepRequested.connect(self.step_layers)
+        lp.tree.blendRequested.connect(self.set_layer_blend)
         lp.add_btn.clicked.connect(self.new_layer)
         lp.opacity.sliderPressed.connect(self._opacity_pressed)
         lp.opacity.valueChanged.connect(self._opacity_value)
@@ -531,12 +534,27 @@ class MainWindow(QMainWindow):
         self.blend.set_preview(self.settings["color"], v)
 
     def set_blend(self, key):
-        """Set the selected layer's blend mode (and the one new layers start with)."""
+        """Draw in another blend mode. Like Procreate, a different mode means a new layer on top;
+        an empty selected layer just switches. A layer's own mode button changes the whole layer."""
         self.settings["blend"] = key
         self.blend.set_mode(key)
         active = self._active_layer()
-        if active is not None and active["blend"] != key:
+        if active is None or active["blend"] == key:
+            return  # with no layer of yours here, the next stroke makes one in this mode
+        if self.store.is_empty(active, *self._size()):
             self._set_layer(active, blend=key)
+        else:
+            self.new_layer()
+
+    def set_layer_blend(self, lid: str, key: str):
+        """Change one of your layers' blend mode (the mode button on its row)."""
+        rec = next((r for r in self.all_by_frame.get(self._frame(), []) if r["id"] == lid), None)
+        if rec is None or rec["blend"] == key:
+            return
+        if rec["author"] != self.prefs.author:
+            self.status.showMessage("Only your own layers' blend modes can be changed.", 4000)
+            return
+        self._set_layer(rec, blend=key)
 
     def _color_changed(self, hex_):
         self.settings["color"] = hex_
@@ -1030,7 +1048,10 @@ class MainWindow(QMainWindow):
         return sorted(by.items(), key=lambda kv: (kv[0] != me, kv[0].lower()))
 
     def _layer_label(self, r: dict) -> str:
-        label = f"{r['name']}   {BLENDS.get(r['blend'], ('?',))[0]} {round(r.get('opacity', 1.0) * 100)}%"
+        """The row text; the blend mode has its own button on the row."""
+        label = r["name"]
+        if r.get("opacity", 1.0) < 1.0:
+            label += f"   {round(r['opacity'] * 100)}%"
         return label if r["author"] == self.prefs.author else f"{label}   {r['author']}"
 
     @staticmethod
@@ -1217,6 +1238,24 @@ class MainWindow(QMainWindow):
         self.redo_stack.clear()
         self._changed()
 
+    def _begin_layer(self):
+        """A stroke is starting with no layer of yours to go into: make one now, so it shows in
+        the list while you draw. It joins the stroke's undo step when the stroke is finished."""
+        if not self._item() or not self.player.info:
+            return
+        rec = self._make_layer(self._frame())
+        self._pending_layer = self._put(self.cur, "layers", rec)
+        self.picked_layer[self._pick_key(rec["frame"])] = rec["id"]
+        self._refresh_notes()
+
+    def _drop_pending_layer(self):
+        """The stroke that made a layer was too small to keep: forget the layer too."""
+        rec, self._pending_layer = self._pending_layer, None
+        it = self._item()
+        if rec is not None and it is not None:
+            it.get("layers", {}).pop(rec["id"], None)
+            self._refresh_notes()
+
     def add_stroke(self, s: dict):
         """Bake a finished stroke into your selected layer, or a new layer on top."""
         if not self._item():
@@ -1224,6 +1263,11 @@ class MainWindow(QMainWindow):
         w, h = self._size()
         target = self._active_layer(s["frame"])
         changes = []
+        pending, self._pending_layer = self._pending_layer, None
+        if target is not None and pending is not None and target["id"] == pending["id"]:
+            changes.append(("layers", None, target))  # made when the stroke started
+        elif pending is not None:
+            self._item().get("layers", {}).pop(pending["id"], None)
         if target is None:
             if s["kind"] in ("erase", "smudge"):
                 return

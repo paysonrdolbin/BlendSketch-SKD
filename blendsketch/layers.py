@@ -145,6 +145,11 @@ class LayerStore:
             e = self.imgs[lid] = [decode(rec, w, h), png, self._next()]
         return e[0]
 
+    def is_empty(self, rec: dict, w: int, h: int) -> bool:
+        if rec["id"] not in self.dirty and not rec.get("png"):
+            return True  # never painted (or only erased) since it was saved or made
+        return content_rect(self.get(rec, w, h)).isEmpty()
+
     def rev(self, lid: str) -> int:
         e = self.imgs.get(lid)
         return e[2] if e else 0

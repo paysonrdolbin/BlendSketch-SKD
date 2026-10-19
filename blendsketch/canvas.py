@@ -19,7 +19,8 @@ RING_TOOLS = ("pen", "brush", "smudge", "eraser")
 
 class Canvas(QWidget):
     strokeCommitted = Signal(dict)  # a finished stroke, for the window to bake into a layer
-    notice = Signal(str)
+    strokeCancelled = Signal()      # a stroke too small to keep
+    layerWanted = Signal()          # a stroke is starting and there's no layer of yours to put it in
     colorPicked = Signal(str)
     decodeSizeWanted = Signal(int, int)
     zoomChanged = Signal(float)
@@ -64,6 +65,9 @@ class Canvas(QWidget):
         self.text_edit.returnPressed.connect(self._commit_text)
         self.text_edit.editingFinished.connect(self._commit_text)
         self.text_edit.installEventFilter(self)
+        self._toast: str | None = None
+        self._toast_timer = QTimer(self, singleShot=True)
+        self._toast_timer.timeout.connect(self._hide_toast)
         self._size_timer = QTimer(self, singleShot=True, interval=120)
         self._size_timer.timeout.connect(self._emit_decode_size)
 
@@ -268,6 +272,35 @@ class Canvas(QWidget):
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, s * self.devicePixelRatioF() < self._img_scale() * 0.999 or self.zoom <= 1.0)
         p.drawImage(target, img)
         self._paint_overlays(p, s)
+        if self._toast:
+            self._paint_toast(p)
+
+    # ------------------------------------------------------------ on-canvas reminders
+
+    def toast(self, text: str, ms: int = 3500):
+        """Show a short reminder over the top of the picture."""
+        self._toast = text
+        self._toast_timer.start(ms)
+        self.update()
+
+    def _hide_toast(self):
+        self._toast = None
+        self.update()
+
+    def _paint_toast(self, p: QPainter):
+        f = QFont(self.font())
+        f.setPixelSize(13)
+        p.setFont(f)
+        fm = p.fontMetrics()
+        w = min(self.width() - 40, fm.horizontalAdvance(self._toast) + 32)
+        text_rect = fm.boundingRect(0, 0, w - 32, 1000, Qt.TextFlag.TextWordWrap, self._toast)
+        box = QRectF((self.width() - w) / 2, 18, w, text_rect.height() + 20)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setPen(QPen(QColor("#f2b84b"), 1))
+        p.setBrush(QColor(11, 12, 16, 235))
+        p.drawRoundedRect(box, 8, 8)
+        p.setPen(QColor("#e9ecf2"))
+        p.drawText(box.adjusted(16, 10, -16, -10), Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, self._toast)
 
     def _paint_overlays(self, p: QPainter, s: float):
         if self._mouse is None:
@@ -385,10 +418,17 @@ class Canvas(QWidget):
         if tool == "text":
             self._open_text(pos, pt)
             return
-        if tool in ("eraser", "smudge") and self.active is None:
-            self.notice.emit(f"No layer of yours to {'erase' if tool == 'eraser' else 'smudge'} on this frame. "
-                             "Draw something first, or pick one of your layers.")
-            return
+        if tool in ("eraser", "smudge"):
+            if self.active is None or L.content_rect(self._layer_image(self.active)).isEmpty():
+                where = "this layer is empty" if self.active is not None else "you have no layer on this frame"
+                if tool == "smudge":
+                    self.toast(f"You're on the smudge brush (S): it moves paint that's already on your layer, "
+                               f"and {where}. Press B for the brush.")
+                else:
+                    self.toast(f"You're on the eraser (E), and {where}. Press B for the brush.")
+                return
+        elif self.active is None:
+            self.layerWanted.emit()  # the window makes a layer and sets self.active before the stroke starts
         st = dict(self.settings)
         st["size"] = self.settings["sizes"][tool]
         kind = "erase" if tool == "eraser" else tool
@@ -494,6 +534,7 @@ class Canvas(QWidget):
         self._smudger = None
         self._comp = None
         if s["kind"] not in PAINT_TOOLS + ("smudge",) and math.hypot(s["pts"][0][0] - s["pts"][1][0], s["pts"][0][1] - s["pts"][1][1]) < 3:
+            self.strokeCancelled.emit()
             self.update()
             return
         self.strokeCommitted.emit(S.tidy(s))

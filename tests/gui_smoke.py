@@ -77,10 +77,20 @@ def main():
     pump(0.3)
 
     # dana: a multiply soft-brush layer, a screen glow layer and an arrow layer
+    assert win.settings["opacity"] == 1.0, "brushes start at 100%"
     win.set_tool("brush"); win.set_blend("multiply"); win.color.set_hex("#6f7fb8", emit=True)
+    c = win.canvas
+    c._down(c.to_widget(300, 700), 1, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+    assert len(win.all_by_frame.get(12, [])) == 1, "starting to draw with no layers makes one right away"
+    assert win.layers_panel.tree.topLevelItemCount() == 1
+    c._up()
     drag(win, [(300 + i * 25, 700 + (i % 2) * 30, 1) for i in range(40)])
     drag(win, [(300 + i * 25, 760 + (i % 2) * 30, 1) for i in range(40)])  # same layer
-    win.new_layer(); win.set_blend("screen"); win.color.set_hex("#ff9a4d", emit=True)
+    assert len(win.all_by_frame[12]) == 1
+    win.set_blend("screen"); win.color.set_hex("#ff9a4d", emit=True)  # a new mode: a new layer
+    assert len(win.all_by_frame[12]) == 2 and win._active_layer()["blend"] == "screen"
+    win.set_blend("overlay"); win.set_blend("screen")  # an empty layer just switches modes
+    assert len(win.all_by_frame[12]) == 2 and win._active_layer()["blend"] == "screen"
     drag(win, [(1500 + 120 * math.cos(a / 10), 400 + 120 * math.sin(a / 10), 1) for a in range(70)])
     win.new_layer(); win.set_tool("arrow"); win.set_blend("normal"); win.color.set_hex("#ef6464", emit=True)
     drag(win, [(900, 200, 1), (1200, 500, 1)])
@@ -158,14 +168,24 @@ def main():
     assert canonical(win.pl.data) == before, "toggling never changes the playlist"
     assert win.prefs.view_state(win.pl.data["id"]) is not None
 
-    # changing the selected layer's blend mode changes the whole layer
+    # a layer's blend mode button changes that layer; the blend panel starts a new layer
     win.pick_layer(ids[0])
     pump(0.05)
     assert win._active_layer()["id"] == ids[0] and win.blend.mode == "multiply"
-    win.set_blend("color-burn")
+    chip = win.layers_panel.tree.itemWidget(row(ids[0]), 1)
+    assert chip.text() == "Multiply" and chip.isEnabled()
+    assert not win.layers_panel.tree.itemWidget(row(ids[3]), 1).isEnabled(), "lead's mode is shown, not changeable"
+    next(a for a in chip.menu().actions() if a.text() == "Color burn").trigger()
+    pump(0.05)
     assert win._item()["layers"][ids[0]]["blend"] == "color-burn"
+    assert win.layers_panel.tree.itemWidget(row(ids[0]), 1).text() == "Color burn"
     win.undo()
     assert win._item()["layers"][ids[0]]["blend"] == "multiply"
+    win.set_blend("difference")
+    assert len(win.all_by_frame[12]) == 5 and win._item()["layers"][ids[0]]["blend"] == "multiply"
+    win.undo()
+    assert len(win.all_by_frame[12]) == 4
+    win.pick_layer(ids[0])
     # layer opacity
     win._opacity_value(50)
     assert win._item()["layers"][ids[0]]["opacity"] == 0.5
@@ -300,6 +320,11 @@ def main():
     assert px(470, 100).name() == before_bare.name(), "footage untouched by smudge"
     # a thick blue pen stroke on a new layer over the magenta bar, then smudge sideways out of it
     win.new_layer()
+    win.set_tool("smudge")
+    c._down(c.to_widget(1330, 200), 1, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+    assert c.live is None and "smudge brush" in (c._toast or ""), "smudging an empty layer shows a reminder"
+    win.grab().save(os.path.join(SHOTS, "2d_smudge_reminder.png"))
+    c._up()
     win.set_tool("pen"); win.set_blend("normal"); win.color.set_hex("#0000ff", emit=True)
     win.settings["sizes"]["pen"] = 40
     win.settings["opacity"] = 1.0
@@ -329,6 +354,10 @@ def main():
     # many strokes on one layer: drawing cost doesn't grow with the stroke count
     win.goto(30)
     assert wait_for(lambda: win.canvas.frame_index == 30 and win.player.image(30) is not None)
+    win.set_tool("ellipse")
+    drag(win, [(500, 500, 1), (501, 501, 1)])  # a click, too small to be a shape
+    assert 30 not in win.all_by_frame and not win.undo_stack[-1:] == [], "the layer it started is dropped too"
+    assert all(r["frame"] != 30 for r in win._item()["layers"].values())
     win.set_tool("brush")
     times = []
     for n in range(80):

@@ -74,6 +74,10 @@ QTreeWidget#NotesTree {{ background: {WELL}; border: 1px solid {LINE}; border-ra
 QTreeWidget#NotesTree::item {{ padding: 3px 2px; border-radius: 4px; }}
 QTreeWidget#NotesTree::item:selected {{ background: {RAISE}; color: {FG}; border: 1px solid {ACCENT}; }}
 QTreeWidget#NotesTree::branch:selected {{ background: transparent; border: 0; }}
+QToolButton#BlendChip {{ font-size: 11px; padding: 1px 7px; margin: 1px 2px; border: 1px solid {LINE}; border-radius: 4px; background: {RAISE}; color: {FG}; }}
+QToolButton#BlendChip:hover {{ border-color: {ACCENT}; }}
+QToolButton#BlendChip:disabled {{ color: {MUTED}; background: transparent; }}
+QToolButton#BlendChip::menu-indicator {{ image: none; width: 0; }}
 
 QSlider::groove:horizontal {{ height: 4px; background: {LINE}; border-radius: 2px; }}
 QSlider::sub-page:horizontal {{ background: {ACCENT}; border-radius: 2px; }}

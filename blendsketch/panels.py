@@ -9,11 +9,12 @@ from PySide6.QtGui import QAction, QColor, QFont, QIcon, QImage, QPainter, QPixm
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QFrame, QHBoxLayout, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox,
-    QStyle, QStyleOptionViewItem, QToolButton, QTreeWidget, QTreeWidgetItem, QMenu, QVBoxLayout, QWidget,
+    QHeaderView, QStyle, QStyleOptionViewItem, QToolButton, QTreeWidget, QTreeWidgetItem, QMenu, QVBoxLayout, QWidget,
 )
 
 from .colors import author_color
 from .icons import icon
+from .strokes import BLENDS
 
 THUMB = QSize(80, 45)
 
@@ -437,6 +438,7 @@ class LayerTree(NotesTree):
     """
 
     layerPicked = Signal(str)
+    blendRequested = Signal(str, str)  # layer id, blend mode, from the mode button on its row
     moveRequested = Signal(list, int)  # layer ids, the row (top first) to insert them before
     stepRequested = Signal(list, int)  # layer ids, -1 up / +1 down
 
@@ -448,11 +450,19 @@ class LayerTree(NotesTree):
         self.setAcceptDrops(True)
         self.setDropIndicatorShown(True)
         self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.setColumnCount(2)  # name, blend mode button
+        self.header().setStretchLastSection(False)
+        self.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self._current_id = None
+        self._menus: list[QMenu] = []  # the blend buttons' menus, parented to the window
         self.currentItemChanged.connect(self._current)
 
     def set_layers(self, layers: list[dict], current: str | None, hidden: set[str], me: str, label):
         """layers: bottom to top, like the canvas; shown top first, like Procreate."""
+        for m in self._menus:
+            m.deleteLater()
+        self._menus = []
         selected = {it.data(0, ID_ROLE) for it in self.selectedItems()} if current == self._current_id else set()
         self._current_id = current
         bar = self.verticalScrollBar().value()
@@ -479,6 +489,7 @@ class LayerTree(NotesTree):
                 it.setFont(0, f)
             it.setToolTip(0, f"{r['name']} by {r['author']}" + ("" if mine else " (you can hide it; you draw on your own layers)"))
             self.addTopLevelItem(it)
+            self.setItemWidget(it, 1, self._blend_button(r, mine))
             if r["id"] == current:
                 self.setCurrentItem(it, 0, QItemSelectionModel.SelectionFlag.NoUpdate)
             # A multi-selection survives a rebuild until the current layer changes.
@@ -487,9 +498,36 @@ class LayerTree(NotesTree):
         self._fit_height()
         self.verticalScrollBar().setValue(bar)
 
+    def _blend_button(self, r: dict, mine: bool) -> QToolButton:
+        """The layer's blend mode, shown on its row; click to change it (your own layers)."""
+        b = QToolButton()
+        b.setObjectName("BlendChip")
+        b.setText(BLENDS.get(r["blend"], ("?",))[0].split(" (")[0])
+        b.setEnabled(mine)
+        b.setToolTip(f"{r['name']} blends with {BLENDS.get(r['blend'], ('?',))[0]}" +
+                     (". Click to change it." if mine else f" ({r['author']}'s layer)"))
+        if mine:
+            # Parented to the window, not this tree, so the inspector's transparent styling can't reach it.
+            m = QMenu(self.window())
+            m.setObjectName("ContextMenu")
+            self._menus.append(m)
+            for key, (label, _) in BLENDS.items():
+                a = m.addAction(label)
+                a.setCheckable(True)
+                a.setChecked(key == r["blend"])
+                a.triggered.connect(lambda _=False, lid=r["id"], k=key: QTimer.singleShot(
+                    0, lambda: self.blendRequested.emit(lid, k)))
+            b.setMenu(m)
+            b.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        return b
+
     def _fit_height(self):
         rows = self.topLevelItemCount()
-        h = (self.sizeHintForRow(0) if rows else 0) * rows + 2 * self.frameWidth() + 6
+        row_h = 0
+        if rows:
+            chip = self.itemWidget(self.topLevelItem(0), 1)
+            row_h = max(self.sizeHintForRow(0), chip.sizeHint().height() + 6 if chip else 0)
+        h = row_h * rows + 2 * self.frameWidth() + 6
         self.setFixedHeight(min(self.cap, max(44, h)))
 
     def _current(self, cur, prev):

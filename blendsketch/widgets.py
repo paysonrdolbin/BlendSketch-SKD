@@ -32,7 +32,7 @@ class BlendPanel(QWidget):
         super().__init__(parent)
         self.mode = "multiply"
         self.color = "#6f7fb8"
-        self.opacity = 0.8
+        self.opacity = 1.0
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(6)
