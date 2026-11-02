@@ -121,6 +121,14 @@ def test_relative_paths_and_mappings():
     assert mapped_candidates("/Volumes/prod/x/y.mov", parse_mappings("/Volumes/prod = /mnt/prod")) == [os.path.normpath("/mnt/prod/x/y.mov")]
 
 
+
+def test_items_are_listed_alphabetically():
+    d = tempfile.mkdtemp()
+    pl = Playlist.create(os.path.join(d, "p.bsplaylist"), "P", "a")
+    for name in ("shot_10", "Bravo", "shot_2", "alpha"):
+        pl.add_item(os.path.join(d, f"{name}.mov"), INFO, "a")
+    assert [it["label"] for it in pl.items()] == ["alpha", "Bravo", "shot_2", "shot_10"]
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

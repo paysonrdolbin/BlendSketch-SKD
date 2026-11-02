@@ -52,7 +52,6 @@ class _ThumbJob(QRunnable):
 
 class PlaylistPanel(QWidget):
     itemSelected = Signal(str)
-    orderChanged = Signal(list)
     addRequested = Signal()
     removeRequested = Signal(str)
     relinkRequested = Signal(str)
@@ -79,12 +78,9 @@ class PlaylistPanel(QWidget):
         self.list = QListWidget()
         self.list.setObjectName("PlaylistList")
         self.list.setIconSize(THUMB)
-        self.list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
-        self.list.setDefaultDropAction(Qt.DropAction.MoveAction)
         self.list.setSpacing(2)
         self.list.setWordWrap(True)
         self.list.currentItemChanged.connect(self._current)
-        self.list.model().rowsMoved.connect(self._moved)
         self.list.itemDoubleClicked.connect(self._double)
         lay.addWidget(self.list, 1)
         btns = QHBoxLayout()
@@ -117,10 +113,6 @@ class PlaylistPanel(QWidget):
     def _current(self, cur, prev):
         if cur and not self._building:
             self.itemSelected.emit(cur.data(Qt.ItemDataRole.UserRole))
-
-    def _moved(self, *a):
-        ids = [self.list.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.list.count())]
-        self.orderChanged.emit(ids)
 
     def _double(self, it):
         if it.data(Qt.ItemDataRole.UserRole + 1):  # missing

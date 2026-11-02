@@ -17,6 +17,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import time
 import uuid
 
@@ -152,6 +153,11 @@ def find_by_name(folder: str, names: set[str], max_depth: int = 3) -> dict[str, 
 
 # ---------------------------------------------------------------- the playlist
 
+def label_key(label: str) -> list:
+    """Sort key for labels: case-insensitive, numbers by value (shot_2 before shot_10)."""
+    return [(0, int(t), "") if t.isdigit() else (1, 0, t.casefold()) for t in re.split(r"(\d+)", label) if t]
+
+
 class Playlist:
     def __init__(self, path: str, data: dict):
         self.path = os.path.abspath(path)
@@ -275,8 +281,10 @@ class Playlist:
         self.data["name"] = {"value": name, "modified": now()}
 
     def items(self) -> list[dict]:
+        """Live items in alphabetical order (the saved order is kept for older versions of the app)."""
         items = self.data["items"]
-        return [items[i] for i in self.data["order"]["value"] if i in items and not items[i].get("deleted")]
+        live = [items[i] for i in self.data["order"]["value"] if i in items and not items[i].get("deleted")]
+        return sorted(live, key=lambda it: label_key(it.get("label", "")))
 
     def item(self, iid: str) -> dict | None:
         return self.data["items"].get(iid)

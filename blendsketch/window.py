@@ -468,7 +468,6 @@ class MainWindow(QMainWindow):
         self.compose.addRequested.connect(self.add_comment)
         pp = self.playlist_panel
         pp.itemSelected.connect(self.open_item)
-        pp.orderChanged.connect(self._reordered)
         pp.addRequested.connect(self.add_media_dialog)
         pp.removeRequested.connect(self.remove_item)
         pp.relinkRequested.connect(self.relink)
@@ -764,11 +763,6 @@ class MainWindow(QMainWindow):
             rows.append({"id": iid, "label": it["label"], "detail": detail, "missing": path is None,
                          "path": path, "frames": info.get("frames", 1), "notes": n})
         self.playlist_panel.set_items(rows, self.cur)
-
-    def _reordered(self, ids):
-        if self.pl:
-            self.pl.set_order(ids)
-            self._changed(refresh_list=False)
 
     # ================================================================ items
 

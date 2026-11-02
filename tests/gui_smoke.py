@@ -69,8 +69,9 @@ def main():
     path = os.path.join(pdir, "Shot review.bsplaylist")
     win._load_playlist(Playlist.create(path, "Shot review", prefs.author))
     win.add_media([os.path.join(FOOT, f) for f in ("shot010_v003.mov", "shot020_v001_4k4444.mov", "edit_ref.mp4")])
-    assert len(win.pl.items()) == 3, "three clips added"
-    win.open_item(win.pl.items()[0]["id"])
+    assert [it["label"] for it in win.pl.items()] == ["edit_ref", "shot010_v003", "shot020_v001_4k4444"], "listed A-Z"
+    clips = {it["label"]: it for it in win.pl.items()}
+    win.open_item(clips["shot010_v003"]["id"])
     assert wait_for(lambda: win.canvas.frame_img is not None), "first frame decoded"
     win.goto(12)
     assert wait_for(lambda: win.player.image(12) is not None), "seek decoded"
@@ -407,7 +408,7 @@ def main():
     assert played > 10, f"playback advanced to {played}"
 
     # 4K ProRes 4444
-    win.open_item(win.pl.items()[1]["id"])
+    win.open_item(clips["shot020_v001_4k4444"]["id"])
     assert wait_for(lambda: win.player.image(0) is not None, 8), "4K frame decoded"
     t = time.time()
     win.player.play()
@@ -420,7 +421,7 @@ def main():
     moved = os.path.join(pdir, "moved")
     os.makedirs(moved)
     shutil.copy(os.path.join(FOOT, "edit_ref.mp4"), moved)
-    third = win.pl.items()[2]
+    third = clips["edit_ref"]
     third["media"] = {"relative": "nope/edit_ref.mp4", "absolute": "/Volumes/gone/edit_ref.mp4", "filename": "edit_ref.mp4"}
     win._resolve_all()
     win.cur = None
@@ -461,7 +462,7 @@ def main():
 
     olds = [old_stroke(0, "dana", "multiply"), old_stroke(1, "dana", "multiply"), old_stroke(2, "dana", "smudge", "smudge"),
             old_stroke(3, "lead", "screen"), old_stroke(4, "dana", "multiply"), old_stroke(5, "dana", "normal", frame=9)]
-    info = win.pl.items()[0]["info"]
+    info = clips["shot010_v003"]["info"]
     data = {"format": "blendsketch-playlist", "version": 1, "id": "old", "created": t0, "created_by": "dana",
             "name": {"value": "Old review", "modified": t0}, "order": {"value": ["i1"], "modified": t0},
             "items": {"i1": {"id": "i1", "label": "shot010", "added_by": "dana", "created": t0, "modified": t0,
