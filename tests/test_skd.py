@@ -91,7 +91,9 @@ def test_sync_reorders_and_keeps_removed_versions_notes():
     new = [versions[2], versions[1], *_versions(d, 13)]
     media[13] = (new[2]["paths"][0], INFO)
     assert skd.sync(pl, new, media, [], "alice")
-    assert [i["id"] for i in pl.items()] == ["sg12", "sg11", "sg13", "sg10"]
+    # ShotGrid's order is saved (older apps show it); the list itself is alphabetical.
+    assert pl.data["order"]["value"] == ["sg12", "sg11", "sg13", "sg10"]
+    assert [i["id"] for i in pl.items()] == ["sg10", "sg11", "sg12", "sg13"]
 
 
 def test_sync_relinks_missing_footage_and_skips_versions_without_any():
